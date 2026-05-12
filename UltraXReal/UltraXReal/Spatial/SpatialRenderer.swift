@@ -5,12 +5,15 @@ import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
 import Combine
+import os
 
 /// Viewport uniform data passed to the Metal fragment shader.
 struct ViewportUniforms {
     var viewportOrigin: SIMD2<Float>  // normalized [0,1]
     var viewportSize: SIMD2<Float>    // normalized [0,1]
 }
+
+private let renderLog = OSLog(subsystem: "com.ultraxreal.app", category: "Renderer")
 
 /// Captures the virtual display via ScreenCaptureKit, applies head-tracking
 /// viewport transform in Metal, and renders to a fullscreen window on the XReal Air.
@@ -43,6 +46,10 @@ final class SpatialRenderer: NSObject, ObservableObject {
     // FPS counter
     private var frameCount = 0
     private var fpsTimer: Timer?
+
+    // Diagnostics — only mutated from the capture queue, no lock needed.
+    private var firstCompleteFrameLogged = false
+    private var lastLoggedStatus: SCFrameStatus?
 
     // Canvas dimensions
     let canvasWidth: Int
@@ -229,8 +236,9 @@ final class SpatialRenderer: NSObject, ObservableObject {
 
     private func startCapture() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-
         guard let display = content.displays.first(where: { $0.displayID == virtualDisplayID }) else {
+            os_log("virtual display %u not in SCShareableContent (%d available)",
+                   log: renderLog, type: .error, virtualDisplayID, content.displays.count)
             throw SpatialRendererError.displayNotFound
         }
 
@@ -265,7 +273,28 @@ final class SpatialRenderer: NSObject, ObservableObject {
 extension SpatialRenderer: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // SCK delivers both real frames (status `.complete`, with a pixel
+        // buffer) and status-only buffers (`.idle`, `.blank`, `.suspended`)
+        // when the captured content isn't changing. An empty virtual display
+        // produces only status-only buffers, so we must skip them rather than
+        // assume every callback carries a frame.
+        let statusKey = SCStreamFrameInfo.status.rawValue as CFString
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+        let status: SCFrameStatus = (attachments?.first?[statusKey] as? Int).flatMap(SCFrameStatus.init(rawValue:)) ?? .complete
+
+        if status != lastLoggedStatus {
+            os_log("SCK status=%{public}@", log: renderLog, type: .info, String(describing: status))
+            lastLoggedStatus = status
+        }
+
+        guard status == .complete, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        if !firstCompleteFrameLogged {
+            firstCompleteFrameLogged = true
+            os_log("SCK first complete frame %dx%d", log: renderLog, type: .info,
+                   CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer))
+        }
 
         frameLock.lock()
         currentPixelBuffer = pixelBuffer
@@ -298,7 +327,19 @@ extension SpatialRenderer: MTKViewDelegate {
         let pixelBuffer = currentPixelBuffer
         frameLock.unlock()
 
-        guard let pixelBuffer else { return }
+        // Until the first complete frame arrives, draw a dark-grey background
+        // so the user can tell the renderer is alive even if SCK is only
+        // delivering "idle" status buffers (which happens on a brand-new
+        // virtual display with nothing on it yet).
+        guard let pixelBuffer else {
+            descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1)
+            guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+            encoder.endEncoding()
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
+            return
+        }
 
         // Zero-copy: create MTLTexture from pixel buffer via CVMetalTextureCache
         let width = CVPixelBufferGetWidth(pixelBuffer)
