@@ -157,7 +157,10 @@ final class SpatialRenderer: NSObject, ObservableObject {
             return false
         }
 
-        metalView = MTKView(frame: CGRect(origin: .zero, size: xrealScreen.frame.size),
+        let screenFrame = xrealScreen.frame
+        print("[Renderer] XReal screen frame=\(screenFrame)")
+
+        metalView = MTKView(frame: CGRect(origin: .zero, size: screenFrame.size),
                             device: metalDevice)
         metalView.delegate = self
         metalView.framebufferOnly = true
@@ -166,20 +169,36 @@ final class SpatialRenderer: NSObject, ObservableObject {
         metalView.isPaused = false
         metalView.enableSetNeedsDisplay = false
 
-        outputWindow = NSWindow(
-            contentRect: xrealScreen.frame,
+        // KeyableBorderlessWindow overrides canBecomeKey/Main → true so MTKView
+        // gets active draw callbacks on macOS 26 Tahoe (where the default `false`
+        // for borderless windows leaves the render loop suspended).
+        let window = KeyableBorderlessWindow(
+            contentRect: screenFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false,
             screen: xrealScreen
         )
-        outputWindow?.level = .screenSaver
-        outputWindow?.isOpaque = true
-        outputWindow?.backgroundColor = .black
-        outputWindow?.contentView = metalView
-        outputWindow?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        outputWindow?.makeKeyAndOrderFront(nil)
+        // Above the shielding window — guaranteed to sit on top of everything,
+        // including spaces transitions and Mission Control. `.screenSaver` was
+        // demoted on Tahoe and got clamped by the window server.
+        window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 1)
+        window.isOpaque = true
+        window.backgroundColor = .black
+        window.hasShadow = false
+        window.contentView = metalView
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        window.isMovable = false
+        window.isExcludedFromWindowsMenu = true
+        window.makeKeyAndOrderFront(nil)
 
+        // Force frame *after* orderFront — Tahoe re-clamps borderless windows
+        // whose initial contentRect has negative origins (XReal Air sits at
+        // global Cocoa coords like (-408, -1080) in our setup). Without this
+        // the window lands on the built-in display as a thin strip.
+        window.setFrame(screenFrame, display: true)
+
+        outputWindow = window
         return true
     }
 
@@ -336,4 +355,14 @@ enum SpatialRendererError: Error {
     case displayNotFound
     case metalSetupFailed
     case capturePermissionDenied
+}
+
+// MARK: - KeyableBorderlessWindow
+
+/// Borderless NSWindow that can become key/main. Required on macOS 26 Tahoe so
+/// MTKView receives active display-link callbacks; without this override the
+/// fragment shader runs once and then idles, leaving a black panel.
+private final class KeyableBorderlessWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
