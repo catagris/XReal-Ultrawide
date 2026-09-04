@@ -18,19 +18,22 @@ struct SpatialState {
 enum SpatialSmoothing: String, CaseIterable, Codable {
     case responsive, balanced, smooth
 
+    // minCutoff must sit below ~1 Hz: ballistocardiac head motion (the
+    // heartbeat) pulses at 1–1.5 Hz and is visible as line shimmer if it
+    // passes the filter. beta compensates by opening the cutoff on real turns.
     var minCutoff: Float {
         switch self {
-        case .responsive: return 2.0
-        case .balanced: return 1.0
-        case .smooth: return 0.4
+        case .responsive: return 1.0
+        case .balanced: return 0.25
+        case .smooth: return 0.1
         }
     }
 
     var beta: Float {
         switch self {
-        case .responsive: return 1.2
-        case .balanced: return 0.7
-        case .smooth: return 0.4
+        case .responsive: return 1.5
+        case .balanced: return 1.0
+        case .smooth: return 0.7
         }
     }
 }
