@@ -11,16 +11,26 @@ struct SpatialState {
     var isCalibrated: Bool = false
 }
 
-/// Smoothing presets for head tracking.
+/// Smoothing presets for head tracking (One Euro filter parameters).
+/// minCutoff governs stillness jitter (lower = calmer when still);
+/// beta governs how quickly smoothing releases during fast motion
+/// (higher = less lag when turning).
 enum SpatialSmoothing: String, CaseIterable, Codable {
     case responsive, balanced, smooth
 
-    /// EMA alpha (higher = more responsive, lower = smoother).
-    var alpha: Float {
+    var minCutoff: Float {
         switch self {
-        case .responsive: return 0.5
-        case .balanced: return 0.3
-        case .smooth: return 0.12
+        case .responsive: return 2.0
+        case .balanced: return 1.0
+        case .smooth: return 0.4
+        }
+    }
+
+    var beta: Float {
+        switch self {
+        case .responsive: return 1.2
+        case .balanced: return 0.7
+        case .smooth: return 0.4
         }
     }
 }
@@ -37,7 +47,10 @@ final class SpatialTracker: ObservableObject {
     var leanToZoomEnabled: Bool = true
     var zoomedLevel: CGFloat = 1.5   // zoom applied after a lean-in gesture
 
-    private let deadZone: Float = 0.004  // radians; ignore micro-jitter
+    // One Euro filter state
+    private var lastRawQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var angularSpeed: Float = 0    // low-passed, rad/s
+    private let speedCutoff: Float = 1.0   // Hz, for the speed estimate itself
 
     // Basis change between view space (x right, y up, -z forward) and the
     // IMU's NED frame (x north/forward, y east, z down). headMatrix = Nᵀ·R·N.
@@ -102,10 +115,18 @@ final class SpatialTracker: ObservableObject {
     func recenter() {
         imuService?.recenter()
         smoothedQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        lastRawQuat = smoothedQuat
+        angularSpeed = 0
         zoomTarget = 1.0
         currentZoom = 1.0
         leanVelocity = 0
         state = SpatialState(headMatrix: matrix_identity_float3x3, zoomLevel: 1.0, isCalibrated: true)
+    }
+
+    /// One Euro helper: EMA alpha for a given cutoff frequency at our sample rate.
+    private func filterAlpha(cutoff: Float) -> Float {
+        let tau = 1.0 / (2.0 * Float.pi * cutoff)
+        return 1.0 / (1.0 + tau / sampleDt)
     }
 
     // MARK: - Private
@@ -113,12 +134,17 @@ final class SpatialTracker: ObservableObject {
     private func update(orientation: simd_quatf) {
         let target = simd_normalize(orientation)
 
-        // Dead zone: skip updates for sub-jitter rotation deltas
-        let delta = smoothedQuat.inverse * target
-        let angle = 2 * acos(min(1, abs(delta.real)))
-        if angle > deadZone {
-            smoothedQuat = simd_slerp(smoothedQuat, target, smoothing.alpha)
-        }
+        // One Euro filter: cutoff frequency scales with angular speed, so the
+        // view is glassy-still when the head is still but tracks with minimal
+        // lag during fast turns.
+        let delta = lastRawQuat.inverse * target
+        let deltaAngle = 2 * acos(min(1, abs(delta.real)))
+        lastRawQuat = target
+
+        angularSpeed += (deltaAngle / sampleDt - angularSpeed) * filterAlpha(cutoff: speedCutoff)
+
+        let cutoff = smoothing.minCutoff + smoothing.beta * angularSpeed
+        smoothedQuat = simd_slerp(smoothedQuat, target, filterAlpha(cutoff: cutoff))
 
         // Ease zoom toward its target (~250ms)
         currentZoom += (zoomTarget - currentZoom) * 0.08
