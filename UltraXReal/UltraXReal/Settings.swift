@@ -69,7 +69,9 @@ final class Settings: ObservableObject {
 
         // Default lean-to-zoom to true on first launch
         if defaults.object(forKey: Keys.leanToZoom) == nil {
-            self.leanToZoomEnabled = true
+            // Off by default: pitch-as-depth-proxy makes looking up zoom in,
+            // which surprises more than it helps. Opt in via the menu.
+            self.leanToZoomEnabled = false
         } else {
             self.leanToZoomEnabled = defaults.bool(forKey: Keys.leanToZoom)
         }

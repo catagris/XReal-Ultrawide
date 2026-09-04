@@ -62,6 +62,12 @@ final class SpatialTracker: ObservableObject {
 
     private weak var imuService: XRealIMUService?
     private var cancellable: AnyCancellable?
+    private var connectionCancellable: AnyCancellable?
+
+    /// Recenter on the first sample after every (re)connect, so the neutral
+    /// pose comes from real data rather than a timer that may fire before
+    /// the IMU is streaming.
+    private var needsInitialRecenter = true
 
     init(imuService: XRealIMUService) {
         self.imuService = imuService
@@ -70,8 +76,21 @@ final class SpatialTracker: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] rawQuat in
                 guard let self else { return }
+                if self.needsInitialRecenter {
+                    self.needsInitialRecenter = false
+                    self.recenter()
+                    return
+                }
                 let relQuat = imuService.relativeOrientation
                 self.update(orientation: relQuat)
+            }
+
+        connectionCancellable = imuService.$isConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                if !connected {
+                    self?.needsInitialRecenter = true
+                }
             }
     }
 
