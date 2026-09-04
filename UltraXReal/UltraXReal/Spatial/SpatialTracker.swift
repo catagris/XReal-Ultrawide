@@ -54,7 +54,7 @@ final class SpatialTracker: ObservableObject {
     /// screen drifts back to center whenever the head settles.
     var followModeEnabled: Bool = false
     private var anchorQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-    private let followAlpha: Float = 0.03  // per-sample chase rate (~0.5s catch-up)
+    private let followAlpha: Float = 0.01  // per-sample chase rate (~1.5s lazy glide)
 
     // One Euro filter state
     private var lastRawQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
