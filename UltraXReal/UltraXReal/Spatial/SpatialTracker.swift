@@ -14,11 +14,14 @@ enum SpatialSensitivity: String, CaseIterable, Codable {
     case low, medium, high
 
     /// Pixels per radian of yaw rotation.
+    /// The Air 2 Pro shows 1920px across ~40° (~0.7 rad), so ~2700 px/rad makes
+    /// the canvas hold still in space as the head turns (world-locked).
+    /// Below that the screen partially follows the head; above it overshoots.
     var pixelsPerRadian: CGFloat {
         switch self {
-        case .low: return 400
-        case .medium: return 800
-        case .high: return 1200
+        case .low: return 2000
+        case .medium: return 2700
+        case .high: return 3400
         }
     }
 }
@@ -118,14 +121,16 @@ final class SpatialTracker: ObservableObject {
         smoothedYaw += (filteredYaw - smoothedYaw) * alpha
         smoothedPitch += (filteredPitch - smoothedPitch) * alpha
 
-        // Map to viewport offset (head right → viewport shifts left)
+        // World-locked mapping: the canvas stays fixed in space, the head
+        // steers the viewport across it — head right → viewport moves right,
+        // head up → viewport moves up.
         let maxOffsetX = canvasSize.width - viewportSize.width
         let maxOffsetY = canvasSize.height - viewportSize.height
         let centerX = maxOffsetX / 2
         let centerY = maxOffsetY / 2
 
-        var offsetX = centerX - (smoothedYaw * sensitivity.pixelsPerRadian)
-        var offsetY = centerY + (smoothedPitch * sensitivity.pixelsPerRadian)
+        var offsetX = centerX + (smoothedYaw * sensitivity.pixelsPerRadian)
+        var offsetY = centerY - (smoothedPitch * sensitivity.pixelsPerRadian)
 
         offsetX = max(0, min(offsetX, maxOffsetX))
         offsetY = max(0, min(offsetY, maxOffsetY))
