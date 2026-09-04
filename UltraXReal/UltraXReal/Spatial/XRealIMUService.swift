@@ -13,6 +13,12 @@ final class XRealIMUService: ObservableObject {
 
     let orientationSubject = PassthroughSubject<simd_quatf, Never>()
 
+    /// Gravity-removed acceleration in the earth NED frame, in g.
+    let accelerationSubject = PassthroughSubject<SIMD3<Float>, Never>()
+
+    /// The "zero" orientation captured by recenter(); identity until then.
+    var referenceOrientation: simd_quatf { referenceQuat }
+
     private var device: UnsafeMutablePointer<device_imu_type>?
     private var readQueue: DispatchQueue?
     private var isRunning = false
@@ -140,6 +146,9 @@ final class XRealIMUService: ObservableObject {
                     self?.orientation = quat
                 }
                 orientationSubject.send(quat)
+
+                let a = device_imu_get_earth_acceleration(ahrs)
+                accelerationSubject.send(SIMD3<Float>(a.x, a.y, a.z))
             }
         }
     }

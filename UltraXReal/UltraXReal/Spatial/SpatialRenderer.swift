@@ -1,20 +1,22 @@
 import AppKit
 import Metal
 import MetalKit
+import simd
 import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
 import Combine
 import os
 
-/// Viewport uniform data passed to the Metal fragment shader.
-/// Layout must match ViewportUniforms in SpatialShaders.metal.
-struct ViewportUniforms {
-    var viewportOrigin: SIMD2<Float>  // normalized [0,1]
-    var viewportSize: SIMD2<Float>    // normalized [0,1]
-    var canvasSizePx: SIMD2<Float>    // canvas pixel dimensions (for aspect-correct roll)
-    var rollAngle: Float              // radians; view counter-rotates to stay level
-    var _pad: Float = 0
+/// Uniform data passed to the Metal fragment shader.
+/// Layout must match FloatingUniforms in SpatialShaders.metal.
+struct FloatingUniforms {
+    var headMatrix: simd_float3x3     // view-space head rotation
+    var tanHalfFov: SIMD2<Float>      // glasses half-FOV tangents
+    var screenHalfSize: SIMD2<Float>  // floating screen half extents, meters
+    var distance: Float               // screen distance in meters
+    var _pad0: Float = 0
+    var _pad1: SIMD2<Float> = .zero
 }
 
 private let renderLog = OSLog(subsystem: "com.ultraxreal.app", category: "Renderer")
@@ -55,16 +57,22 @@ final class SpatialRenderer: NSObject, ObservableObject {
     private var firstCompleteFrameLogged = false
     private var lastLoggedStatus: SCFrameStatus?
 
-    // Canvas dimensions
+    // Virtual monitor dimensions (pixels, what macOS renders)
     let canvasWidth: Int
     let canvasHeight: Int
-    let viewportWidth: Int = 1920
-    let viewportHeight: Int = 1080
+
+    // Floating screen geometry — updatable live from the menu sliders.
+    var screenDiagonalInches: Float = 65
+    var screenDistanceMeters: Float = 2.0
+
+    // XREAL Air 2 Pro: 46° diagonal FOV, 16:9 → ~40.5° horizontal.
+    private let tanHalfFovX: Float = 0.369
+    private let tanHalfFovY: Float = 0.369 * 1080.0 / 1920.0
 
     init(virtualDisplayID: CGDirectDisplayID,
          spatialTracker: SpatialTracker,
-         canvasWidth: Int = 3840,
-         canvasHeight: Int = 2160) {
+         canvasWidth: Int = 1920,
+         canvasHeight: Int = 1080) {
         self.virtualDisplayID = virtualDisplayID
         self.spatialTracker = spatialTracker
         self.canvasWidth = canvasWidth
@@ -359,22 +367,23 @@ extension SpatialRenderer: MTKViewDelegate {
               let cvTex = cvTexture,
               let texture = CVMetalTextureGetTexture(cvTex) else { return }
 
-        // Compute viewport uniforms from spatial tracker state
+        // Compute uniforms from tracker state + screen geometry.
         let state = spatialTracker.state
 
-        let canvasW = Float(canvasWidth)
-        let canvasH = Float(canvasHeight)
-        let zoomedW = Float(viewportWidth) / Float(state.zoomLevel)
-        let zoomedH = Float(viewportHeight) / Float(state.zoomLevel)
+        // Diagonal inches → physical extents in meters (16:9).
+        let diagMeters = screenDiagonalInches * 0.0254
+        let aspectNorm = Float((16.0 * 16.0 + 9.0 * 9.0).squareRoot())
+        let halfW = diagMeters * 16.0 / aspectNorm / 2.0
+        let halfH = diagMeters * 9.0 / aspectNorm / 2.0
 
-        let originX = Float(state.viewportOffset.x) / canvasW
-        let originY = Float(state.viewportOffset.y) / canvasH
+        // Lean-zoom brings the screen closer instead of cropping pixels.
+        let distance = screenDistanceMeters / Float(state.zoomLevel)
 
-        var uniforms = ViewportUniforms(
-            viewportOrigin: SIMD2<Float>(originX, originY),
-            viewportSize: SIMD2<Float>(zoomedW / canvasW, zoomedH / canvasH),
-            canvasSizePx: SIMD2<Float>(canvasW, canvasH),
-            rollAngle: Float(state.rollAngle)
+        var uniforms = FloatingUniforms(
+            headMatrix: state.headMatrix,
+            tanHalfFov: SIMD2<Float>(tanHalfFovX, tanHalfFovY),
+            screenHalfSize: SIMD2<Float>(halfW, halfH),
+            distance: distance
         )
 
         // Render
@@ -385,7 +394,7 @@ extension SpatialRenderer: MTKViewDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(texture, index: 0)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ViewportUniforms>.stride, index: 0)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FloatingUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 

@@ -62,7 +62,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(staticItem)
 
         // Spatial mode toggle
-        let spatialTitle = isSpatialActive ? "Disable Spatial" : "Enable Spatial (Floating)"
+        let spatialTitle = isSpatialActive ? "Disable Floating Screen" : "Enable Floating Screen"
         let spatialItem = NSMenuItem(title: spatialTitle, action: #selector(toggleSpatialDisplay), keyEquivalent: "s")
         spatialItem.target = self
         if isSpatialActive {
@@ -123,31 +123,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         spatialMenu.addItem(NSMenuItem.separator())
 
-        // Screen size / distance
-        let sizeMenu = NSMenu()
-        for size in SpatialScreenSize.allCases {
-            let item = NSMenuItem(title: size.label, action: #selector(changeScreenSize(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = size.rawValue
-            if settings.screenSize == size { item.state = .on }
-            sizeMenu.addItem(item)
-        }
-        let sizeItem = NSMenuItem(title: "Screen Size", action: nil, keyEquivalent: "")
-        sizeItem.submenu = sizeMenu
-        spatialMenu.addItem(sizeItem)
+        // Screen size + distance sliders (TV-style, live while wearing)
+        let sizeSliderItem = NSMenuItem()
+        sizeSliderItem.view = SliderMenuItemView(
+            title: "Screen Size",
+            min: 32, max: 150,
+            value: settings.screenInches,
+            format: { String(format: "%.0f\"", $0) },
+            onChange: { [weak self] value in
+                self?.settings.screenInches = value
+                self?.spatialRenderer?.screenDiagonalInches = Float(value)
+            }
+        )
+        spatialMenu.addItem(sizeSliderItem)
 
-        // Sensitivity
-        let sensMenu = NSMenu()
-        for sens in SpatialSensitivity.allCases {
-            let item = NSMenuItem(title: sens.rawValue.capitalized, action: #selector(changeSensitivity(_:)), keyEquivalent: "")
+        let distSliderItem = NSMenuItem()
+        distSliderItem.view = SliderMenuItemView(
+            title: "Distance",
+            min: 1.0, max: 4.0,
+            value: settings.screenDistance,
+            format: { String(format: "%.1fm", $0) },
+            onChange: { [weak self] value in
+                self?.settings.screenDistance = value
+                self?.spatialRenderer?.screenDistanceMeters = Float(value)
+            }
+        )
+        spatialMenu.addItem(distSliderItem)
+
+        spatialMenu.addItem(NSMenuItem.separator())
+
+        // Floating monitor resolution
+        let spatialResMenu = NSMenu()
+        for res in SpatialResolution.allCases {
+            let item = NSMenuItem(title: res.label, action: #selector(changeSpatialResolution(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = sens.rawValue
-            if settings.spatialSensitivity == sens { item.state = .on }
-            sensMenu.addItem(item)
+            item.representedObject = res.rawValue
+            if settings.spatialResolution == res { item.state = .on }
+            spatialResMenu.addItem(item)
         }
-        let sensItem = NSMenuItem(title: "Sensitivity", action: nil, keyEquivalent: "")
-        sensItem.submenu = sensMenu
-        spatialMenu.addItem(sensItem)
+        let spatialResItem = NSMenuItem(title: "Monitor Resolution", action: nil, keyEquivalent: "")
+        spatialResItem.submenu = spatialResMenu
+        spatialMenu.addItem(spatialResItem)
 
         // Smoothing
         let smoothMenu = NSMenu()
@@ -189,7 +205,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(fpsItem)
 
             if let id = displayManager.currentDisplayID {
-                let canvasItem = NSMenuItem(title: "Canvas: 3840x2160 (ID: \(id))", action: nil, keyEquivalent: "")
+                let res = settings.spatialResolution
+                let canvasItem = NSMenuItem(title: "Monitor: \(res.width)x\(res.height) (ID: \(id))", action: nil, keyEquivalent: "")
                 canvasItem.isEnabled = false
                 menu.addItem(canvasItem)
             }
@@ -302,8 +319,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func enableSpatialMode() {
-        // 1. Create large canvas virtual display
-        displayManager.enableSpatialCanvas()
+        // 1. Create the floating monitor's virtual display
+        let res = settings.spatialResolution
+        displayManager.enableSpatialCanvas(width: res.width, height: res.height)
 
         // 2. Wait for display, then set up the spatial pipeline
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -324,8 +342,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // 4. Start spatial tracker
             let tracker = SpatialTracker(imuService: imu)
-            tracker.sensitivity = self.settings.spatialSensitivity
-            tracker.screenScale = self.settings.screenSize.scale
             tracker.smoothing = self.settings.spatialSmoothing
             tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
             self.spatialTracker = tracker
@@ -333,8 +349,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // 5. Start renderer
             let renderer = SpatialRenderer(
                 virtualDisplayID: virtualID,
-                spatialTracker: tracker
+                spatialTracker: tracker,
+                canvasWidth: Int(res.width),
+                canvasHeight: Int(res.height)
             )
+            renderer.screenDiagonalInches = Float(self.settings.screenInches)
+            renderer.screenDistanceMeters = Float(self.settings.screenDistance)
             renderer.start()
             self.spatialRenderer = renderer
 
@@ -379,11 +399,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Spatial Settings Actions
 
-    @objc private func changeSensitivity(_ sender: NSMenuItem) {
+    @objc private func changeSpatialResolution(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
-              let sens = SpatialSensitivity(rawValue: raw) else { return }
-        settings.spatialSensitivity = sens
-        spatialTracker?.sensitivity = sens
+              let res = SpatialResolution(rawValue: raw) else { return }
+        settings.spatialResolution = res
+        // Takes effect on next spatial enable; restart if currently active.
+        if isSpatialActive {
+            disableSpatialMode()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.enableSpatialMode()
+            }
+        }
         buildMenu()
     }
 
@@ -401,13 +427,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
-    @objc private func changeScreenSize(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let size = SpatialScreenSize(rawValue: raw) else { return }
-        settings.screenSize = size
-        spatialTracker?.screenScale = size.scale
-        buildMenu()
-    }
 
     // MARK: - Shared Actions
 
@@ -502,5 +521,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 button.image?.isTemplate = true
             }
         }
+    }
+}
+
+// MARK: - SliderMenuItemView
+
+/// A menu item hosting a live slider with a title and value readout.
+/// Custom-view items don't close the menu on interaction, so the user can
+/// drag while watching the effect through the glasses.
+final class SliderMenuItemView: NSView {
+    private let valueLabel = NSTextField(labelWithString: "")
+    private let slider = NSSlider()
+    private let format: (Double) -> String
+    private let onChange: (Double) -> Void
+
+    init(title: String,
+         min: Double, max: Double, value: Double,
+         format: @escaping (Double) -> String,
+         onChange: @escaping (Double) -> Void) {
+        self.format = format
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 48))
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .menuFont(ofSize: 13)
+        titleLabel.frame = NSRect(x: 14, y: 26, width: 150, height: 17)
+        addSubview(titleLabel)
+
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: 160, y: 26, width: 86, height: 17)
+        valueLabel.stringValue = format(value)
+        addSubview(valueLabel)
+
+        slider.minValue = min
+        slider.maxValue = max
+        slider.doubleValue = value
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(slid(_:))
+        slider.frame = NSRect(x: 14, y: 4, width: 232, height: 20)
+        addSubview(slider)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc private func slid(_ sender: NSSlider) {
+        valueLabel.stringValue = format(sender.doubleValue)
+        onChange(sender.doubleValue)
     }
 }
