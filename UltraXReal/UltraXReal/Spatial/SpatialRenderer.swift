@@ -49,6 +49,12 @@ final class SpatialRenderer: NSObject, ObservableObject {
     private var currentPixelBuffer: CVPixelBuffer?
     private let frameLock = NSLock()
 
+    // Mipmapped copy of the captured frame. The raycast minifies the screen
+    // texture (a 65" screen at 2m covers a fraction of the FOV), and sampling
+    // the raw capture with a linear filter aliases badly — crawling text
+    // lines. Regenerating mips each frame + trilinear/aniso sampling fixes it.
+    private var mipTexture: MTLTexture?
+
     // FPS counter
     private var frameCount = 0
     private var fpsTimer: Timer?
@@ -367,6 +373,15 @@ extension SpatialRenderer: MTKViewDelegate {
               let cvTex = cvTexture,
               let texture = CVMetalTextureGetTexture(cvTex) else { return }
 
+        if mipTexture == nil || mipTexture!.width != width || mipTexture!.height != height {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: true)
+            desc.usage = [.shaderRead, .renderTarget]
+            desc.storageMode = .private
+            mipTexture = metalDevice.makeTexture(descriptor: desc)
+        }
+        guard let mipTexture else { return }
+
         // Compute uniforms from tracker state + screen geometry.
         let state = spatialTracker.state
 
@@ -389,11 +404,23 @@ extension SpatialRenderer: MTKViewDelegate {
         // Render
         descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+
+        // Copy the captured frame into the mip chain and regenerate levels.
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(from: texture, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: width, height: height, depth: 1),
+                      to: mipTexture, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.generateMipmaps(for: mipTexture)
+            blit.endEncoding()
+        }
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
 
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentTexture(mipTexture, index: 0)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FloatingUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()

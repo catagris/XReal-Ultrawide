@@ -44,6 +44,7 @@ final class Settings: ObservableObject {
         static let screenInches = "floatingScreenInches"
         static let screenDistance = "floatingScreenDistance"
         static let spatialResolution = "spatialResolution"
+        static let followMode = "followModeEnabled"
     }
 
     @Published var selectedResolution: DisplayResolution {
@@ -89,6 +90,10 @@ final class Settings: ObservableObject {
         didSet { defaults.set(spatialResolution.rawValue, forKey: Keys.spatialResolution) }
     }
 
+    @Published var followModeEnabled: Bool {
+        didSet { defaults.set(followModeEnabled, forKey: Keys.followMode) }
+    }
+
     private init() {
         let resRaw = defaults.string(forKey: Keys.resolution) ?? DisplayResolution.ultrawide2560x1080.rawValue
         self.selectedResolution = DisplayResolution(rawValue: resRaw) ?? .ultrawide2560x1080
@@ -108,6 +113,8 @@ final class Settings: ObservableObject {
 
         let resRawSpatial = defaults.string(forKey: Keys.spatialResolution) ?? SpatialResolution.fhd1080.rawValue
         self.spatialResolution = SpatialResolution(rawValue: resRawSpatial) ?? .fhd1080
+
+        self.followModeEnabled = defaults.bool(forKey: Keys.followMode)
 
         // On by default: the lean gesture is impulse-based, so it no longer
         // fires from just looking up.

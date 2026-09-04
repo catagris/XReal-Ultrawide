@@ -184,6 +184,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         zoomItem.state = settings.leanToZoomEnabled ? .on : .off
         spatialMenu.addItem(zoomItem)
 
+        // Follow mode toggle: screen chases and recenters on the gaze
+        let followItem = NSMenuItem(title: "Follow My View", action: #selector(toggleFollowMode(_:)), keyEquivalent: "")
+        followItem.target = self
+        followItem.state = settings.followModeEnabled ? .on : .off
+        spatialMenu.addItem(followItem)
+
         let spatialSettingsItem = NSMenuItem(title: "Spatial Settings", action: nil, keyEquivalent: "")
         spatialSettingsItem.submenu = spatialMenu
         menu.addItem(spatialSettingsItem)
@@ -344,6 +350,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let tracker = SpatialTracker(imuService: imu)
             tracker.smoothing = self.settings.spatialSmoothing
             tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
+            tracker.followModeEnabled = self.settings.followModeEnabled
             self.spatialTracker = tracker
 
             // 5. Start renderer
@@ -424,6 +431,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleLeanToZoom(_ sender: NSMenuItem) {
         settings.leanToZoomEnabled.toggle()
         spatialTracker?.leanToZoomEnabled = settings.leanToZoomEnabled
+        buildMenu()
+    }
+
+    @objc private func toggleFollowMode(_ sender: NSMenuItem) {
+        settings.followModeEnabled.toggle()
+        spatialTracker?.followModeEnabled = settings.followModeEnabled
         buildMenu()
     }
 

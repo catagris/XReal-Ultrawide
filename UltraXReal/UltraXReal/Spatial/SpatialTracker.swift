@@ -50,6 +50,12 @@ final class SpatialTracker: ObservableObject {
     var leanToZoomEnabled: Bool = true
     var zoomedLevel: CGFloat = 1.5   // zoom applied after a lean-in gesture
 
+    /// Follow mode: the screen's anchor chases the gaze direction, so the
+    /// screen drifts back to center whenever the head settles.
+    var followModeEnabled: Bool = false
+    private var anchorQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private let followAlpha: Float = 0.03  // per-sample chase rate (~0.5s catch-up)
+
     // One Euro filter state
     private var lastRawQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var angularSpeed: Float = 0    // low-passed, rad/s
@@ -119,6 +125,7 @@ final class SpatialTracker: ObservableObject {
         imuService?.recenter()
         smoothedQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         lastRawQuat = smoothedQuat
+        anchorQuat = smoothedQuat
         angularSpeed = 0
         zoomTarget = 1.0
         currentZoom = 1.0
@@ -152,7 +159,15 @@ final class SpatialTracker: ObservableObject {
         // Ease zoom toward its target (~250ms)
         currentZoom += (zoomTarget - currentZoom) * 0.08
 
-        let rotNed = simd_float3x3(smoothedQuat)
+        // Follow mode: render relative to a lazily-chasing anchor instead of
+        // the fixed recentered frame — the screen trails turns, then recenters.
+        var effectiveQuat = smoothedQuat
+        if followModeEnabled {
+            anchorQuat = simd_normalize(simd_slerp(anchorQuat, smoothedQuat, followAlpha))
+            effectiveQuat = anchorQuat.inverse * smoothedQuat
+        }
+
+        let rotNed = simd_float3x3(effectiveQuat)
         let headMatrix = viewToNed.transpose * rotNed * viewToNed
 
         state = SpatialState(

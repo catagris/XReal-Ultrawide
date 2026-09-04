@@ -61,6 +61,7 @@ fragment float4 spatialFragment(
         return float4(0, 0, 0, 1);
     }
 
-    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler s(filter::linear, mip_filter::linear,
+                        max_anisotropy(8), address::clamp_to_edge);
     return screenTexture.sample(s, uv);
 }
