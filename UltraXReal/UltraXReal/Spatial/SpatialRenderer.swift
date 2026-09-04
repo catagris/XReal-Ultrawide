@@ -8,9 +8,13 @@ import Combine
 import os
 
 /// Viewport uniform data passed to the Metal fragment shader.
+/// Layout must match ViewportUniforms in SpatialShaders.metal.
 struct ViewportUniforms {
     var viewportOrigin: SIMD2<Float>  // normalized [0,1]
     var viewportSize: SIMD2<Float>    // normalized [0,1]
+    var canvasSizePx: SIMD2<Float>    // canvas pixel dimensions (for aspect-correct roll)
+    var rollAngle: Float              // radians; view counter-rotates to stay level
+    var _pad: Float = 0
 }
 
 private let renderLog = OSLog(subsystem: "com.ultraxreal.app", category: "Renderer")
@@ -368,7 +372,9 @@ extension SpatialRenderer: MTKViewDelegate {
 
         var uniforms = ViewportUniforms(
             viewportOrigin: SIMD2<Float>(originX, originY),
-            viewportSize: SIMD2<Float>(zoomedW / canvasW, zoomedH / canvasH)
+            viewportSize: SIMD2<Float>(zoomedW / canvasW, zoomedH / canvasH),
+            canvasSizePx: SIMD2<Float>(canvasW, canvasH),
+            rollAngle: Float(state.rollAngle)
         )
 
         // Render
@@ -379,7 +385,7 @@ extension SpatialRenderer: MTKViewDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(texture, index: 0)
-        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ViewportUniforms>.size, index: 0)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ViewportUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 

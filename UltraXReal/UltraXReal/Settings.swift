@@ -16,6 +16,7 @@ final class Settings: ObservableObject {
         static let sensitivity = "spatialSensitivity"
         static let smoothing = "spatialSmoothing"
         static let leanToZoom = "leanToZoomEnabled"
+        static let screenSize = "spatialScreenSize"
     }
 
     @Published var selectedResolution: DisplayResolution {
@@ -53,6 +54,10 @@ final class Settings: ObservableObject {
         didSet { defaults.set(leanToZoomEnabled, forKey: Keys.leanToZoom) }
     }
 
+    @Published var screenSize: SpatialScreenSize {
+        didSet { defaults.set(screenSize.rawValue, forKey: Keys.screenSize) }
+    }
+
     private init() {
         let resRaw = defaults.string(forKey: Keys.resolution) ?? DisplayResolution.ultrawide2560x1080.rawValue
         self.selectedResolution = DisplayResolution(rawValue: resRaw) ?? .ultrawide2560x1080
@@ -66,6 +71,9 @@ final class Settings: ObservableObject {
 
         let smoothRaw = defaults.string(forKey: Keys.smoothing) ?? SpatialSmoothing.balanced.rawValue
         self.spatialSmoothing = SpatialSmoothing(rawValue: smoothRaw) ?? .balanced
+
+        let sizeRaw = defaults.string(forKey: Keys.screenSize) ?? SpatialScreenSize.medium.rawValue
+        self.screenSize = SpatialScreenSize(rawValue: sizeRaw) ?? .medium
 
         // Default lean-to-zoom to true on first launch
         if defaults.object(forKey: Keys.leanToZoom) == nil {

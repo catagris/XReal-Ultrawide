@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Carbon.HIToolbox
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -12,6 +13,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var spatialRenderer: SpatialRenderer?
     private var isSpatialActive = false
     private var globalHotkeyMonitor: Any?
+    private var recenterHotKeyRef: EventHotKeyRef?
+    private var hotkeyEventHandler: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -119,6 +122,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         spatialMenu.addItem(recenterItem)
 
         spatialMenu.addItem(NSMenuItem.separator())
+
+        // Screen size / distance
+        let sizeMenu = NSMenu()
+        for size in SpatialScreenSize.allCases {
+            let item = NSMenuItem(title: size.label, action: #selector(changeScreenSize(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = size.rawValue
+            if settings.screenSize == size { item.state = .on }
+            sizeMenu.addItem(item)
+        }
+        let sizeItem = NSMenuItem(title: "Screen Size", action: nil, keyEquivalent: "")
+        sizeItem.submenu = sizeMenu
+        spatialMenu.addItem(sizeItem)
 
         // Sensitivity
         let sensMenu = NSMenu()
@@ -309,6 +325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // 4. Start spatial tracker
             let tracker = SpatialTracker(imuService: imu)
             tracker.sensitivity = self.settings.spatialSensitivity
+            tracker.screenScale = self.settings.screenSize.scale
             tracker.smoothing = self.settings.spatialSmoothing
             tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
             self.spatialTracker = tracker
@@ -384,6 +401,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
+    @objc private func changeScreenSize(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let size = SpatialScreenSize(rawValue: raw) else { return }
+        settings.screenSize = size
+        spatialTracker?.screenScale = size.scale
+        buildMenu()
+    }
+
     // MARK: - Shared Actions
 
     @objc private func changeResolution(_ sender: NSMenuItem) {
@@ -444,12 +469,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Global Hotkey
 
     private func setupRecenterHotkey() {
-        globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            // Cmd+Shift+R (keyCode 15 = R)
-            if event.modifierFlags.contains([.command, .shift]) && event.keyCode == 15 {
-                self?.recenterSpatial()
-            }
-        }
+        // Carbon hotkey: fires system-wide without the Accessibility/Input
+        // Monitoring permission that NSEvent global monitors silently require.
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData else { return noErr }
+            let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async { delegate.recenterSpatial() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &hotkeyEventHandler)
+
+        let hotKeyID = EventHotKeyID(signature: OSType(0x5558_5252), id: 1) // 'UXRR'
+        RegisterEventHotKey(UInt32(kVK_ANSI_R), UInt32(cmdKey | shiftKey),
+                            hotKeyID, GetApplicationEventTarget(), 0, &recenterHotKeyRef)
     }
 
     // MARK: - Icon
