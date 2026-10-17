@@ -59,6 +59,8 @@ final class SpatialRenderer: NSObject, ObservableObject {
         self.canvasWidth = canvasWidth
         self.canvasHeight = canvasHeight
         super.init()
+        spatialTracker.canvasSize = CGSize(width: canvasWidth, height: canvasHeight)
+        spatialTracker.viewportSize = CGSize(width: viewportWidth, height: viewportHeight)
     }
 
     deinit {
@@ -166,13 +168,15 @@ final class SpatialRenderer: NSObject, ObservableObject {
         metalView.isPaused = false
         metalView.enableSetNeedsDisplay = false
 
+        // Position explicitly in global coordinates to avoid applying the screen origin twice.
         outputWindow = NSWindow(
-            contentRect: xrealScreen.frame,
+            contentRect: CGRect(origin: .zero, size: xrealScreen.frame.size),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false,
-            screen: xrealScreen
+            screen: nil
         )
+        outputWindow?.setFrame(xrealScreen.frame, display: true)
         outputWindow?.level = .screenSaver
         outputWindow?.isOpaque = true
         outputWindow?.backgroundColor = .black

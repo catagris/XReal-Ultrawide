@@ -99,14 +99,14 @@ final class SpatialTracker: ObservableObject {
         smoothedYaw += (filteredYaw - smoothedYaw) * alpha
         smoothedPitch += (filteredPitch - smoothedPitch) * alpha
 
-        // Map to viewport offset (head right → viewport shifts left)
+        // Move the viewport with the head to reveal the canvas in that direction.
         let maxOffsetX = canvasSize.width - viewportSize.width
         let maxOffsetY = canvasSize.height - viewportSize.height
         let centerX = maxOffsetX / 2
         let centerY = maxOffsetY / 2
 
-        var offsetX = centerX - (smoothedYaw * sensitivity.pixelsPerRadian)
-        var offsetY = centerY + (smoothedPitch * sensitivity.pixelsPerRadian)
+        var offsetX = centerX + (smoothedYaw * sensitivity.pixelsPerRadian)
+        var offsetY = centerY - (smoothedPitch * sensitivity.pixelsPerRadian)
 
         offsetX = max(0, min(offsetX, maxOffsetX))
         offsetY = max(0, min(offsetY, maxOffsetY))
