@@ -356,7 +356,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let token = UUID()
         sessionGeneration = token
         // Resolve glasses before creating 1080p virtual monitors.
-        _ = DisplayMirrorHelper.unmirror(displayID: outputID)
+        if CGDisplayIsInMirrorSet(outputID) != 0 {
+            _ = DisplayMirrorHelper.unmirror(displayID: outputID)
+        }
         // Drain even an unpublished static startup before reusing display serials.
         displayManager.disable { [weak self] in
             guard let self, self.sessionGeneration == token else { return }
@@ -374,7 +376,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .failure(let error):
                 self.failSpatialSession(error.localizedDescription)
             case .success(let ids):
-                guard DisplayMirrorHelper.unmirror(displayID: outputID) else {
+                guard CGDisplayIsInMirrorSet(outputID) == 0 || DisplayMirrorHelper.unmirror(displayID: outputID) else {
                     self.failSpatialSession("Could not extend the glasses display.")
                     return
                 }
@@ -414,6 +416,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func failSpatialSession(_ message: String) {
+        NSLog("Spatial session failed: %@", message)
         sessionError = message
         disableSpatialMode()
     }
