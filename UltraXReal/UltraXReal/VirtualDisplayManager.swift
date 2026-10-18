@@ -104,12 +104,27 @@ final class VirtualDisplayManager: ObservableObject {
             return
         }
 
-        let applied = display.apply(settings)
-        if !applied {
-            print("Warning: spatial display apply(settings) returned false")
+        guard display.apply(settings) else {
+            DispatchQueue.main.async { [weak self] in
+                let message = "Failed to apply spatial display settings."
+                self?.lastError = message
+                self?.postErrorNotification(message)
+            }
+            return
         }
 
         let displayID = display.displayID
+
+        // macOS may default to a scaled 1920×1080 desktop. The renderer crops
+        // canvas pixels, so select matching desktop and pixel dimensions at 1×.
+        guard selectSpatialMode(displayID: displayID, width: width, height: height) else {
+            DispatchQueue.main.async { [weak self] in
+                let message = "Failed to select the native \(width)×\(height) spatial display mode."
+                self?.lastError = message
+                self?.postErrorNotification(message)
+            }
+            return
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.virtualDisplay = display
@@ -119,6 +134,29 @@ final class VirtualDisplayManager: ObservableObject {
     }
 
     // MARK: - Private: Display creation via bridging header
+
+    private func selectSpatialMode(displayID: CGDirectDisplayID, width: UInt32, height: UInt32) -> Bool {
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        guard let modes = CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode],
+              let nativeMode = modes.first(where: {
+                  $0.width == Int(width) && $0.height == Int(height) &&
+                  $0.pixelWidth == Int(width) && $0.pixelHeight == Int(height)
+              }) else { return false }
+
+        var configuration: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&configuration) == .success,
+              let configuration else { return false }
+
+        guard CGConfigureDisplayWithDisplayMode(configuration, displayID, nativeMode, nil) == .success else {
+            CGCancelDisplayConfiguration(configuration)
+            return false
+        }
+        guard CGCompleteDisplayConfiguration(configuration, .forSession) == .success,
+              let currentMode = CGDisplayCopyDisplayMode(displayID) else { return false }
+
+        return currentMode.width == Int(width) && currentMode.height == Int(height) &&
+               currentMode.pixelWidth == Int(width) && currentMode.pixelHeight == Int(height)
+    }
 
     private func createDisplay(resolution: DisplayResolution) {
         // Create descriptor
