@@ -134,6 +134,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         smoothItem.submenu = smoothMenu
         spatialMenu.addItem(smoothItem)
 
+        // Base zoom
+        let zoomMenu = NSMenu()
+        for zoom in SpatialZoom.allCases {
+            let item = NSMenuItem(title: zoom.label, action: #selector(changeSpatialZoom(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = zoom.rawValue
+            if settings.spatialZoom == zoom { item.state = .on }
+            zoomMenu.addItem(item)
+        }
+        let baseZoomItem = NSMenuItem(title: "Zoom", action: nil, keyEquivalent: "")
+        baseZoomItem.submenu = zoomMenu
+        spatialMenu.addItem(baseZoomItem)
+
         // Lean-to-Zoom toggle
         let zoomItem = NSMenuItem(title: "Lean-to-Zoom", action: #selector(toggleLeanToZoom(_:)), keyEquivalent: "")
         zoomItem.target = self
@@ -299,6 +312,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             tracker.sensitivity = self.settings.spatialSensitivity
             tracker.smoothing = self.settings.spatialSmoothing
             tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
+            tracker.baseZoom = self.settings.spatialZoom
             self.spatialTracker = tracker
 
             // 5. Start renderer
@@ -346,6 +360,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Spatial Settings Actions
+
+    @objc private func changeSpatialZoom(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? Double,
+              let zoom = SpatialZoom(rawValue: raw) else { return }
+        settings.spatialZoom = zoom
+        spatialTracker?.baseZoom = zoom
+        buildMenu()
+    }
 
     @objc private func changeSensitivity(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,

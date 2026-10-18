@@ -5,8 +5,17 @@ import simd
 /// Viewport state derived from head tracking.
 struct SpatialState {
     var viewportOffset: CGPoint = .zero  // pixel offset on the virtual canvas
-    var zoomLevel: CGFloat = 1.0         // 1.0 = normal, up to 2.5x
+    var zoomLevel: CGFloat = 0.75        // 1.0 = pixel-for-pixel; lower values show more canvas
     var isCalibrated: Bool = false
+}
+
+/// Persistent base zoom, independent of optional lean-to-zoom magnification.
+enum SpatialZoom: Double, CaseIterable {
+    case fiftyPercent = 0.5
+    case seventyFivePercent = 0.75
+    case oneHundredPercent = 1.0
+
+    var label: String { "\(Int(rawValue * 100))%" }
 }
 
 /// Sensitivity presets for head tracking.
@@ -47,6 +56,9 @@ final class SpatialTracker: ObservableObject {
 
     var sensitivity: SpatialSensitivity = .medium
     var smoothing: SpatialSmoothing = .balanced
+    var baseZoom: SpatialZoom = .seventyFivePercent {
+        didSet { publishState() }
+    }
     var leanToZoomEnabled: Bool = true
     var zoomSensitivity: CGFloat = 2.0
     var zoomThreshold: CGFloat = 0.15  // radians of pitch before zoom kicks in
@@ -81,7 +93,7 @@ final class SpatialTracker: ObservableObject {
         smoothedYaw = 0
         smoothedPitch = 0
         neutralPitch = 0
-        state = SpatialState(viewportOffset: .zero, zoomLevel: 1.0, isCalibrated: true)
+        publishState()
     }
 
     // MARK: - Private
@@ -99,9 +111,23 @@ final class SpatialTracker: ObservableObject {
         smoothedYaw += (filteredYaw - smoothedYaw) * alpha
         smoothedPitch += (filteredPitch - smoothedPitch) * alpha
 
+        publishState()
+    }
+
+    private func publishState() {
+        // Calculate zoom first because it determines the visible area and pan limits.
+        var zoom = CGFloat(baseZoom.rawValue)
+        if leanToZoomEnabled {
+            let pitchDelta = smoothedPitch - neutralPitch
+            if pitchDelta > zoomThreshold {
+                zoom += (pitchDelta - zoomThreshold) * zoomSensitivity
+                zoom = min(zoom, 2.5)
+            }
+        }
+
         // Move the viewport with the head to reveal the canvas in that direction.
-        let maxOffsetX = canvasSize.width - viewportSize.width
-        let maxOffsetY = canvasSize.height - viewportSize.height
+        let maxOffsetX = max(0, canvasSize.width - viewportSize.width / zoom)
+        let maxOffsetY = max(0, canvasSize.height - viewportSize.height / zoom)
         let centerX = maxOffsetX / 2
         let centerY = maxOffsetY / 2
 
@@ -110,16 +136,6 @@ final class SpatialTracker: ObservableObject {
 
         offsetX = max(0, min(offsetX, maxOffsetX))
         offsetY = max(0, min(offsetY, maxOffsetY))
-
-        // Lean-to-zoom: pitch delta from neutral as depth proxy
-        var zoom: CGFloat = 1.0
-        if leanToZoomEnabled {
-            let pitchDelta = smoothedPitch - neutralPitch
-            if pitchDelta > zoomThreshold {
-                zoom = 1.0 + (pitchDelta - zoomThreshold) * zoomSensitivity
-                zoom = min(zoom, 2.5)
-            }
-        }
 
         state = SpatialState(
             viewportOffset: CGPoint(x: offsetX, y: offsetY),
