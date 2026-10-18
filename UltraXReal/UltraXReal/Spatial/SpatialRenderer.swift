@@ -299,7 +299,7 @@ final class SpatialRenderer: NSObject, ObservableObject {
                             device: metalDevice)
         metalView.delegate = self
         metalView.framebufferOnly = true
-        metalView.preferredFramesPerSecond = 60
+        metalView.preferredFramesPerSecond = xrealScreen.maximumFramesPerSecond
         metalView.colorPixelFormat = .bgra8Unorm
         metalView.isPaused = true
         metalView.enableSetNeedsDisplay = false
@@ -417,7 +417,7 @@ extension SpatialRenderer: MTKViewDelegate {
             validMask |= 1 << UInt32(slot)
         }
 
-        let state = spatialTracker.state
+        let state = spatialTracker.presentationState(at: ProcessInfo.processInfo.systemUptime + 0.008)
         let diagonal = max(1, screenDiagonalInches) * 0.0254
         let aspectNorm = Float((16.0 * 16.0 + 9.0 * 9.0).squareRoot())
         var uniforms = FloatingUniforms(

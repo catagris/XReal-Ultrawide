@@ -31,9 +31,9 @@ enum SpatialSmoothing: String, CaseIterable, Codable {
 
     var beta: Float {
         switch self {
-        case .responsive: return 1.5
-        case .balanced: return 1.0
-        case .smooth: return 0.7
+        case .responsive: return 40
+        case .balanced: return 30
+        case .smooth: return 20
         }
     }
 }
@@ -58,6 +58,8 @@ final class SpatialTracker: ObservableObject {
 
     // One Euro filter state
     private var lastRawQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var sampleTime: TimeInterval = 0
+    private var angularVelocity = SIMD3<Float>.zero
     private var angularSpeed: Float = 0    // low-passed, rad/s
     private let speedCutoff: Float = 1.0   // Hz, for the speed estimate itself
 
@@ -76,8 +78,8 @@ final class SpatialTracker: ObservableObject {
     private var currentZoom: CGFloat = 1.0
     private var accelBias: Float = 0        // slow EMA of forward accel (m/s²)
     private var leanVelocity: Float = 0     // leaky integral of forward accel
-    private var debounceSamples: Int = 0
-    private let sampleDt: Float = 1.0 / 60.0
+    private var debounceRemaining: Float = 0
+    private var sampleDt: Float = 1.0 / 60.0
     private let leanThreshold: Float = 0.22 // m/s of integrated forward motion
 
     private weak var imuService: XRealIMUService?
@@ -94,7 +96,6 @@ final class SpatialTracker: ObservableObject {
         self.imuService = imuService
 
         cancellable = imuService.orientationSubject
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] rawQuat in
                 guard let self else { return }
                 if self.needsInitialRecenter {
@@ -102,11 +103,12 @@ final class SpatialTracker: ObservableObject {
                     self.recenter()
                     return
                 }
-                self.update(orientation: imuService.relativeOrientation)
+                self.sampleDt = imuService.sampleInterval
+                self.sampleTime = imuService.sampleTime
+                self.update(orientation: imuService.referenceOrientation.inverse * rawQuat)
             }
 
         accelCancellable = imuService.accelerationSubject
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] earthAccel in
                 self?.processLean(earthAccel: earthAccel)
             }
@@ -127,9 +129,13 @@ final class SpatialTracker: ObservableObject {
         lastRawQuat = smoothedQuat
         anchorQuat = smoothedQuat
         angularSpeed = 0
+        angularVelocity = .zero
+        sampleTime = 0
         zoomTarget = 1.0
         currentZoom = 1.0
         leanVelocity = 0
+        accelBias = 0
+        debounceRemaining = 0
         state = SpatialState(headMatrix: matrix_identity_float3x3, zoomLevel: 1.0, isCalibrated: true)
     }
 
@@ -147,8 +153,11 @@ final class SpatialTracker: ObservableObject {
         // One Euro filter: cutoff frequency scales with angular speed, so the
         // view is glassy-still when the head is still but tracks with minimal
         // lag during fast turns.
-        let delta = lastRawQuat.inverse * target
-        let deltaAngle = 2 * acos(min(1, abs(delta.real)))
+        var delta = simd_normalize(lastRawQuat.inverse * target)
+        if delta.real < 0 { delta = simd_quatf(vector: -delta.vector) }
+        let deltaAngle = 2 * atan2(simd_length(delta.imag), max(0, delta.real))
+        let velocity = deltaAngle > 0.000001 ? delta.imag / simd_length(delta.imag) * (deltaAngle / sampleDt) : .zero
+        angularVelocity += (velocity - angularVelocity) * filterAlpha(cutoff: 20)
         lastRawQuat = target
 
         angularSpeed += (deltaAngle / sampleDt - angularSpeed) * filterAlpha(cutoff: speedCutoff)
@@ -157,13 +166,13 @@ final class SpatialTracker: ObservableObject {
         smoothedQuat = simd_slerp(smoothedQuat, target, filterAlpha(cutoff: cutoff))
 
         // Ease zoom toward its target (~250ms)
-        currentZoom += (zoomTarget - currentZoom) * 0.08
+        currentZoom += (zoomTarget - currentZoom) * (1 - pow(0.92, CGFloat(sampleDt * 60)))
 
         // Follow mode: render relative to a lazily-chasing anchor instead of
         // the fixed recentered frame — the screen trails turns, then recenters.
         var effectiveQuat = smoothedQuat
         if followModeEnabled {
-            anchorQuat = simd_normalize(simd_slerp(anchorQuat, smoothedQuat, followAlpha))
+            anchorQuat = simd_normalize(simd_slerp(anchorQuat, smoothedQuat, 1 - pow(1 - followAlpha, sampleDt * 60)))
             effectiveQuat = anchorQuat.inverse * smoothedQuat
         }
 
@@ -175,6 +184,20 @@ final class SpatialTracker: ObservableObject {
             zoomLevel: currentZoom,
             isCalibrated: true
         )
+    }
+
+    /// Evaluate orientation at presentation time instead of holding each USB sample for a frame.
+    func presentationState(at time: TimeInterval) -> SpatialState {
+        guard sampleTime > 0, time - sampleTime < 0.05, !followModeEnabled else { return state }
+        let speed = simd_length(angularVelocity)
+        guard speed > 0.01 else { return state }
+        let cutoff = smoothing.minCutoff + smoothing.beta * angularSpeed
+        let filterDelay = min(0.025, 1 / (2 * Float.pi * cutoff))
+        let horizon = min(0.035, max(0, Float(time - sampleTime)) + filterDelay)
+        let predicted = smoothedQuat * simd_quatf(angle: min(0.12, speed * horizon), axis: angularVelocity / speed)
+        var result = state
+        result.headMatrix = viewToNed.transpose * simd_float3x3(predicted) * viewToNed
+        return result
     }
 
     /// Detect a deliberate lean-in (forward acceleration impulse) → zoom in,
@@ -194,21 +217,21 @@ final class SpatialTracker: ObservableObject {
 
         // Remove slow bias (sensor offset, posture), integrate with decay so
         // the velocity estimate spikes on impulses but bleeds back to zero.
-        accelBias += (accelMs2 - accelBias) * 0.01
-        leanVelocity = (leanVelocity + (accelMs2 - accelBias) * sampleDt) * 0.92
+        accelBias += (accelMs2 - accelBias) * (1 - pow(0.99, sampleDt * 60))
+        leanVelocity = (leanVelocity + (accelMs2 - accelBias) * sampleDt) * pow(0.92, sampleDt * 60)
 
-        if debounceSamples > 0 {
-            debounceSamples -= 1
+        if debounceRemaining > 0 {
+            debounceRemaining -= sampleDt
             return
         }
 
         if leanVelocity > leanThreshold, zoomTarget == 1.0 {
             zoomTarget = zoomedLevel   // lean in → zoom, holds until lean-back
-            debounceSamples = 50       // ~0.8s: ignore the stop transient
+            debounceRemaining = 50 / 60.0       // ~0.8s: ignore the stop transient
             leanVelocity = 0
         } else if leanVelocity < -leanThreshold, zoomTarget > 1.0 {
             zoomTarget = 1.0
-            debounceSamples = 50
+            debounceRemaining = 50 / 60.0
             leanVelocity = 0
         }
     }

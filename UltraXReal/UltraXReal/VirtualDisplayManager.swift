@@ -38,6 +38,9 @@ final class VirtualDisplayManager: ObservableObject {
     private var generation: UInt64 = 0
     private var isStarting = false
     private var isSpatialSession = false
+    private var viewerPlacement: (id: CGDirectDisplayID, anchor: CGDirectDisplayID, offset: CGPoint)?
+    private var cursorGuard: Timer?
+    private var lastDesktopCursor: CGPoint?
     private var originalMainDisplayID: CGDirectDisplayID?
     private var staticResolutionBeforeSleep: DisplayResolution?
     private var sleepObserver: NSObjectProtocol?
@@ -89,6 +92,7 @@ final class VirtualDisplayManager: ObservableObject {
             generation &+= 1
             isStarting = false
             restoreMainDisplay()
+            restoreViewerPlacement()
             currentDisplayID = nil
             spatialDisplayIDs = []
             isActive = false
@@ -111,6 +115,76 @@ final class VirtualDisplayManager: ObservableObject {
         onMain { [self] in
             guard isActive else { return }
             disable { [weak self] in self?.enable(resolution: resolution) }
+        }
+    }
+
+    /// Keep the physical glasses output outside the interactive desktop chain.
+    @discardableResult
+    func routeSpatialDesktop(viewerID: CGDirectDisplayID) -> Bool {
+        guard Thread.isMainThread, !spatialDisplayIDs.isEmpty else { return false }
+        let physical = Self.onlineDisplayIDs().filter {
+            $0 != viewerID && !spatialDisplayIDs.contains($0) && CGDisplayIsActive($0) != 0 && CGDisplayMirrorsDisplay($0) == 0
+        }
+        guard let anchor = physical.first(where: { CGDisplayIsBuiltin($0) != 0 }) ?? physical.first else { return false }
+        let anchorOrigin = CGDisplayBounds(anchor).origin
+        let oldOrigin = CGDisplayBounds(viewerID).origin
+        let bounds = physical.map { CGDisplayBounds($0) }
+        let startX = bounds.map(\.maxX).max() ?? 0
+        var configuration: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else { return false }
+        var x = startX
+        for id in spatialDisplayIDs {
+            guard CGConfigureDisplayOrigin(configuration, id, Int32(x), Int32(anchorOrigin.y)) == .success else {
+                CGCancelDisplayConfiguration(configuration)
+                return false
+            }
+            x += CGDisplayBounds(id).width
+        }
+        // A disconnected output has no shared edge through which the pointer can travel.
+        let parkedY = (bounds.map(\.minY).min() ?? 0) - CGDisplayBounds(viewerID).height - 4096
+        guard CGConfigureDisplayOrigin(configuration, viewerID, Int32(anchorOrigin.x), Int32(parkedY)) == .success else {
+            CGCancelDisplayConfiguration(configuration)
+            return false
+        }
+        guard CGCompleteDisplayConfiguration(configuration, .forSession) == .success else { return false }
+        viewerPlacement = (viewerID, anchor, CGPoint(x: oldOrigin.x - anchorOrigin.x, y: oldOrigin.y - anchorOrigin.y))
+        cursorGuard?.invalidate()
+        let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
+            guard let self, let point = CGEvent(source: nil)?.location else { return }
+            let interactive = Self.onlineDisplayIDs().filter { $0 != viewerID && CGDisplayIsActive($0) != 0 }
+            if CGDisplayBounds(viewerID).contains(point) {
+                let fallback = self.currentDisplayID.map { CGDisplayBounds($0) } ?? CGDisplayBounds(anchor)
+                let previous = self.lastDesktopCursor.flatMap { saved in
+                    interactive.contains(where: { CGDisplayBounds($0).contains(saved) }) ? saved : nil
+                }
+                CGWarpMouseCursorPosition(previous ?? CGPoint(x: fallback.midX, y: fallback.midY))
+            } else if interactive.contains(where: { CGDisplayBounds($0).contains(point) }) {
+                self.lastDesktopCursor = point
+            }
+        }
+        cursorGuard = timer
+        RunLoop.main.add(timer, forMode: .common)
+        return true
+    }
+
+    func restoreViewerPlacement() {
+        cursorGuard?.invalidate()
+        cursorGuard = nil
+        lastDesktopCursor = nil
+        guard let placement = viewerPlacement else { return }
+        viewerPlacement = nil
+        let ids = Self.onlineDisplayIDs()
+        guard ids.contains(placement.id), ids.contains(placement.anchor) else { return }
+        let anchor = CGDisplayBounds(placement.anchor).origin
+        var configuration: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&configuration) == .success, let configuration else { return }
+        guard CGConfigureDisplayOrigin(configuration, placement.id,
+                                       Int32(anchor.x + placement.offset.x), Int32(anchor.y + placement.offset.y)) == .success else {
+            CGCancelDisplayConfiguration(configuration)
+            return
+        }
+        if CGCompleteDisplayConfiguration(configuration, .forSession) != .success {
+            lastError = "Could not restore the glasses display position."
         }
     }
 

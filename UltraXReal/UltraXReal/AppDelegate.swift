@@ -51,6 +51,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         permissionTimer?.invalidate()
         displayManager.restoreMainDisplay()
+        displayManager.restoreViewerPlacement()
         spatialRenderer?.stop()
         imuService?.stop()
         if let recenterHotKeyRef { UnregisterEventHotKey(recenterHotKeyRef) }
@@ -419,6 +420,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     guard let self, self.sessionGeneration == token, self.spatialRequested else { return }
                     switch result {
                     case .success:
+                        guard self.displayManager.routeSpatialDesktop(viewerID: outputID) else {
+                            self.failSpatialSession("Could not keep the glasses viewer outside the desktop pointer path.")
+                            return
+                        }
                         self.sessionPhase = .running
                         self.applyMainMonitor()
                         self.warpCursorToVirtualDisplay()

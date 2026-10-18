@@ -11,6 +11,9 @@ final class XRealIMUService: ObservableObject {
     @Published private(set) var isConnected = false
     @Published private(set) var orientation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
 
+    private(set) var sampleInterval: Float = 1 / 60
+    private(set) var sampleTime: TimeInterval = 0
+
     let orientationSubject = PassthroughSubject<simd_quatf, Never>()
 
     /// Gravity-removed acceleration in the earth NED frame, in g.
@@ -130,6 +133,7 @@ final class XRealIMUService: ObservableObject {
     // MARK: - Private
 
     private func readLoop() {
+        var previousTimestamp: UInt64 = 0
         while isRunning, let dev = device {
             let err = device_imu_read(dev, 16) // 16ms timeout ≈ 60Hz
 
@@ -142,13 +146,22 @@ final class XRealIMUService: ObservableObject {
                 let q = device_imu_get_orientation(ahrs)
                 let quat = simd_quatf(ix: q.x, iy: q.y, iz: q.z, r: q.w)
 
-                DispatchQueue.main.async { [weak self] in
-                    self?.orientation = quat
-                }
-                orientationSubject.send(quat)
-
+                let timestamp = dev.pointee.last_timestamp
+                guard timestamp > previousTimestamp else { continue }
+                let interval = previousTimestamp == 0 ? Float(1 / 60.0) : Float(timestamp - previousTimestamp) / 1e9
+                previousTimestamp = timestamp
+                let receivedAt = ProcessInfo.processInfo.systemUptime
                 let a = device_imu_get_earth_acceleration(ahrs)
-                accelerationSubject.send(SIMD3<Float>(a.x, a.y, a.z))
+                let acceleration = SIMD3<Float>(a.x, a.y, a.z)
+                // Publish one coherent sample. A timeout must never republish stale orientation.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isRunning else { return }
+                    self.sampleInterval = min(0.1, max(0.0001, interval))
+                    self.sampleTime = receivedAt
+                    self.orientation = quat
+                    self.orientationSubject.send(quat)
+                    self.accelerationSubject.send(acceleration)
+                }
             }
         }
     }
