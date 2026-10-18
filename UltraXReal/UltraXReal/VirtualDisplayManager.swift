@@ -107,9 +107,13 @@ final class VirtualDisplayManager: ObservableObject {
             return
         }
 
-        let applied = display.apply(settings)
-        if !applied {
-            print("Warning: spatial display apply(settings) returned false")
+        guard display.apply(settings) else {
+            DispatchQueue.main.async { [weak self] in
+                let message = "Failed to apply spatial display settings."
+                self?.lastError = message
+                self?.postErrorNotification(message)
+            }
+            return
         }
 
         let displayID = display.displayID
@@ -117,7 +121,14 @@ final class VirtualDisplayManager: ObservableObject {
         // macOS gives the new display a default ~1080p mode; explicitly switch
         // to the requested full-size mode or the canvas renders at a quarter
         // of its intended area (and the viewport looks 2x zoomed in).
-        setCurrentMode(displayID: displayID, pixelsWide: Int(width), pixelsHigh: Int(height))
+        guard setCurrentMode(displayID: displayID, pixelsWide: Int(width), pixelsHigh: Int(height)) else {
+            DispatchQueue.main.async { [weak self] in
+                let message = "Failed to select the native \(width)×\(height) spatial display mode."
+                self?.lastError = message
+                self?.postErrorNotification(message)
+            }
+            return
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.virtualDisplay = display
@@ -126,22 +137,25 @@ final class VirtualDisplayManager: ObservableObject {
         }
     }
 
-    private func setCurrentMode(displayID: CGDirectDisplayID, pixelsWide: Int, pixelsHigh: Int) {
-        guard let modes = CGDisplayCopyAllDisplayModes(displayID, nil) as? [CGDisplayMode],
-              let native = modes.first(where: { $0.pixelWidth == pixelsWide && $0.pixelHeight == pixelsHigh })
-        else {
-            print("Warning: \(pixelsWide)x\(pixelsHigh) mode not found on display \(displayID)")
-            return
+    private func setCurrentMode(displayID: CGDirectDisplayID, pixelsWide: Int, pixelsHigh: Int) -> Bool {
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        let matches: (CGDisplayMode) -> Bool = {
+            $0.width == pixelsWide && $0.height == pixelsHigh &&
+            $0.pixelWidth == pixelsWide && $0.pixelHeight == pixelsHigh
         }
-        guard CGDisplayCopyDisplayMode(displayID)?.pixelWidth != pixelsWide else { return }
+        if let current = CGDisplayCopyDisplayMode(displayID), matches(current) { return true }
+        guard let modes = CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode],
+              let native = modes.first(where: matches) else { return false }
 
         var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return }
-        CGConfigureDisplayWithDisplayMode(config, displayID, native, nil)
-        let result = CGCompleteDisplayConfiguration(config, .forSession)
-        if result != .success {
-            print("Warning: failed to set \(pixelsWide)x\(pixelsHigh) mode: \(result.rawValue)")
+        guard CGBeginDisplayConfiguration(&config) == .success, let config else { return false }
+        guard CGConfigureDisplayWithDisplayMode(config, displayID, native, nil) == .success else {
+            CGCancelDisplayConfiguration(config)
+            return false
         }
+        guard CGCompleteDisplayConfiguration(config, .forSession) == .success,
+              let current = CGDisplayCopyDisplayMode(displayID) else { return false }
+        return matches(current)
     }
 
     // MARK: - Private: Display creation via bridging header
