@@ -1,6 +1,18 @@
 import Foundation
 import ServiceManagement
 
+enum SpatialMonitorCount: Int, CaseIterable {
+    case one = 1, two = 2, three = 3
+
+    var names: [String] {
+        switch self {
+        case .one: return ["Center"]
+        case .two: return ["Left", "Right"]
+        case .three: return ["Left", "Center", "Right"]
+        }
+    }
+}
+
 /// Resolution of the floating virtual monitor.
 enum SpatialResolution: String, CaseIterable, Codable {
     case fhd1080, qhd1440
@@ -45,6 +57,8 @@ final class Settings: ObservableObject {
         static let screenDistance = "floatingScreenDistance"
         static let spatialResolution = "spatialResolution"
         static let followMode = "followModeEnabled"
+        static let monitorCount = "spatialMonitorCount"
+        static let mainMonitor = "spatialMainMonitor"
     }
 
     @Published var selectedResolution: DisplayResolution {
@@ -94,6 +108,15 @@ final class Settings: ObservableObject {
         didSet { defaults.set(followModeEnabled, forKey: Keys.followMode) }
     }
 
+    @Published var monitorCount: SpatialMonitorCount {
+        didSet { defaults.set(monitorCount.rawValue, forKey: Keys.monitorCount) }
+    }
+
+    /// -1 keeps the original physical main display; otherwise a left-to-right index.
+    @Published var mainMonitorIndex: Int {
+        didSet { defaults.set(mainMonitorIndex, forKey: Keys.mainMonitor) }
+    }
+
     private init() {
         let resRaw = defaults.string(forKey: Keys.resolution) ?? DisplayResolution.ultrawide2560x1080.rawValue
         self.selectedResolution = DisplayResolution(rawValue: resRaw) ?? .ultrawide2560x1080
@@ -115,6 +138,10 @@ final class Settings: ObservableObject {
         self.spatialResolution = SpatialResolution(rawValue: resRawSpatial) ?? .fhd1080
 
         self.followModeEnabled = defaults.bool(forKey: Keys.followMode)
+        let monitorCount = SpatialMonitorCount(rawValue: defaults.integer(forKey: Keys.monitorCount)) ?? .three
+        self.monitorCount = monitorCount
+        let storedMain = defaults.object(forKey: Keys.mainMonitor) as? Int ?? -1
+        self.mainMonitorIndex = (-1..<monitorCount.rawValue).contains(storedMain) ? storedMain : -1
 
         // On by default: the lean gesture is impulse-based, so it no longer
         // fires from just looking up.

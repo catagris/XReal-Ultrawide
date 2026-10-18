@@ -6,133 +6,238 @@ import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
 import Combine
-import os
 
-/// Uniform data passed to the Metal fragment shader.
-/// Layout must match FloatingUniforms in SpatialShaders.metal.
+/// Metal float3x3 occupies three aligned 16-byte columns. Total stride: 96 bytes.
 struct FloatingUniforms {
-    var headMatrix: simd_float3x3     // view-space head rotation
-    var tanHalfFov: SIMD2<Float>      // glasses half-FOV tangents
-    var screenHalfSize: SIMD2<Float>  // floating screen half extents, meters
-    var distance: Float               // screen distance in meters
-    var _pad0: Float = 0
-    var _pad1: SIMD2<Float> = .zero
+    var headMatrix: simd_float3x3
+    var optics: SIMD4<Float>          // half-FOV tangents, screen half-width/height
+    var layout: SIMD4<Float>          // distance, inward angle, gap, unused
+    var configuration: SIMD4<UInt32>  // monitor count, valid-texture bitmask, unused
 }
 
-private let renderLog = OSLog(subsystem: "com.ultraxreal.app", category: "Renderer")
-
-/// Captures the virtual display via ScreenCaptureKit, applies head-tracking
-/// viewport transform in Metal, and renders to a fullscreen window on the XReal Air.
+/// One transactional capture/render session. UI, GPU encoding and lifecycle live
+/// on the main thread; capture callbacks only update the locked frame snapshots.
 final class SpatialRenderer: NSObject, ObservableObject {
-
     @Published private(set) var isRunning = false
-    @Published private(set) var fps: Int = 0
+    @Published private(set) var isStopping = false
+    @Published private(set) var fps = 0
+    var onFailure: ((Error) -> Void)?
 
-    private let virtualDisplayID: CGDirectDisplayID
+    private let virtualDisplayIDs: [CGDirectDisplayID]
+    private let outputDisplayID: CGDirectDisplayID
     private let spatialTracker: SpatialTracker
+    let canvasWidth: Int
+    let canvasHeight: Int
+    var screenDiagonalInches: Float = 65
+    var screenDistanceMeters: Float = 2
 
-    // Metal
     private var metalDevice: MTLDevice!
     private var commandQueue: MTLCommandQueue!
     private var pipelineState: MTLRenderPipelineState!
     private var textureCache: CVMetalTextureCache!
-
-    // Display output
     private var outputWindow: NSWindow?
     private var metalView: MTKView!
-
-    // Screen capture
-    private var stream: SCStream?
-    private var captureQueue = DispatchQueue(label: "com.ultraxreal.capture", qos: .userInteractive)
-
-    // Frame management
-    private var currentPixelBuffer: CVPixelBuffer?
+    private var mipTextures: [MTLTexture?] = [nil, nil, nil]
+    private var blackTexture: MTLTexture?
+    private var streams: [SCStream] = []
+    private let captureQueue = DispatchQueue(label: "com.ultraxreal.capture", qos: .userInteractive)
     private let frameLock = NSLock()
-
-    // Mipmapped copy of the captured frame. The raycast minifies the screen
-    // texture (a 65" screen at 2m covers a fraction of the FOV), and sampling
-    // the raw capture with a linear filter aliases badly — crawling text
-    // lines. Regenerating mips each frame + trilinear/aniso sampling fixes it.
-    private var mipTexture: MTLTexture?
-
-    // FPS counter
+    private var streamSlots: [ObjectIdentifier: Int] = [:]
+    private var currentPixelBuffers: [CVPixelBuffer?] = [nil, nil, nil]
+    private var generation: UInt64 = 0
+    private var startupTask: Task<Void, Never>?
+    private var startupFailure: Error?
+    private var stopCompletions: [() -> Void] = []
     private var frameCount = 0
     private var fpsTimer: Timer?
+    private var screenObserver: NSObjectProtocol?
 
-    // Virtual monitor dimensions (pixels, what macOS renders)
-    let canvasWidth: Int
-    let canvasHeight: Int
-
-    // Floating screen geometry — updatable live from the menu sliders.
-    var screenDiagonalInches: Float = 65
-    var screenDistanceMeters: Float = 2.0
-
-    // XREAL Air 2 Pro: 46° diagonal FOV, 16:9 → ~40.5° horizontal.
-    private let tanHalfFovX: Float = 0.369
-    private let tanHalfFovY: Float = 0.369 * 1080.0 / 1920.0
-
-    init(virtualDisplayID: CGDirectDisplayID,
-         spatialTracker: SpatialTracker,
-         canvasWidth: Int = 1920,
-         canvasHeight: Int = 1080) {
-        self.virtualDisplayID = virtualDisplayID
+    init(virtualDisplayIDs: [CGDirectDisplayID], outputDisplayID: CGDirectDisplayID,
+         spatialTracker: SpatialTracker, canvasWidth: Int, canvasHeight: Int) {
+        self.virtualDisplayIDs = virtualDisplayIDs
+        self.outputDisplayID = outputDisplayID
         self.spatialTracker = spatialTracker
         self.canvasWidth = canvasWidth
         self.canvasHeight = canvasHeight
         super.init()
     }
 
-    deinit {
-        stop()
+    convenience init(virtualDisplayID: CGDirectDisplayID, spatialTracker: SpatialTracker,
+                     canvasWidth: Int = 1920, canvasHeight: Int = 1080) {
+        self.init(virtualDisplayIDs: [virtualDisplayID],
+                  outputDisplayID: DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: virtualDisplayID) ?? 0,
+                  spatialTracker: spatialTracker, canvasWidth: canvasWidth, canvasHeight: canvasHeight)
     }
 
-    // MARK: - Public
-
     func start() {
-        guard !isRunning else { return }
-
-        guard setupMetal() else {
-            print("[Renderer] Failed to set up Metal")
-            return
-        }
-
-        guard setupOutputWindow() else {
-            print("[Renderer] Failed to find XReal Air display for output")
-            return
-        }
-
-        Task {
-            do {
-                try await startCapture()
-                DispatchQueue.main.async { [weak self] in
-                    self?.isRunning = true
-                    self?.startFPSCounter()
-                }
-            } catch {
-                print("[Renderer] Failed to start capture: \(error)")
+        start { [weak self] result in
+            if case .failure(let error) = result, !(error is CancellationError) {
+                self?.onFailure?(error)
             }
         }
     }
 
-    func stop() {
+    func start(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.start(completion: completion) }
+            return
+        }
+        guard !isStopping, startupTask == nil, !isRunning else {
+            completion(.failure(SpatialRendererError.sessionBusy))
+            return
+        }
+        guard (1...3).contains(virtualDisplayIDs.count),
+              Set(virtualDisplayIDs).count == virtualDisplayIDs.count,
+              !virtualDisplayIDs.contains(outputDisplayID), outputDisplayID != 0,
+              canvasWidth > 0, canvasHeight > 0 else {
+            completion(.failure(SpatialRendererError.invalidConfiguration))
+            return
+        }
+        precondition(MemoryLayout<FloatingUniforms>.stride == 96)
+        guard setupMetal() else {
+            completion(.failure(SpatialRendererError.metalSetupFailed))
+            return
+        }
+        guard setupOutputWindow() else {
+            completion(.failure(SpatialRendererError.outputDisplayNotFound))
+            return
+        }
+        generation &+= 1
+        let token = generation
+        startupFailure = nil
+        observeOutputDisplay(generation: token)
+        startupTask = Task { @MainActor in
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                try checkStartup(token)
+                for (slot, displayID) in virtualDisplayIDs.enumerated() {
+                    guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                        throw SpatialRendererError.displayNotFound
+                    }
+                    let configuration = SCStreamConfiguration()
+                    configuration.width = canvasWidth
+                    configuration.height = canvasHeight
+                    configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+                    configuration.pixelFormat = kCVPixelFormatType_32BGRA
+                    configuration.queueDepth = 3
+                    configuration.showsCursor = true
+                    let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
+                                          configuration: configuration, delegate: self)
+                    try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+                    streams.append(stream)
+                    register(stream, slot: slot)
+                    try await stream.startCapture()
+                    try checkStartup(token)
+                }
+                isRunning = true
+                metalView?.isPaused = false
+                frameCount = 0
+                fpsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self = self] _ in
+                    guard let self else { return }
+                    self.fps = self.frameCount
+                    self.frameCount = 0
+                }
+                startupTask = nil
+                completion(.success(()))
+            } catch {
+                await closeCaptures()
+                tearDownOutput()
+                startupTask = nil
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func checkStartup(_ token: UInt64) throws {
+        if let startupFailure { throw startupFailure }
+        guard generation == token, !isStopping else { throw CancellationError() }
+    }
+
+    func stop(completion: (() -> Void)? = nil) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.stop(completion: completion) }
+            return
+        }
+        if let completion { stopCompletions.append(completion) }
+        guard !isStopping else { return }
+        isStopping = true
+        generation &+= 1
         isRunning = false
+        tearDownOutput()
+        let pendingStartup = startupTask
+        Task { @MainActor in
+            await pendingStartup?.value
+            await closeCaptures()
+            mipTextures = [nil, nil, nil]
+            fps = 0
+            isStopping = false
+            let completions = stopCompletions
+            stopCompletions.removeAll()
+            completions.forEach { $0() }
+        }
+    }
+
+    private func tearDownOutput() {
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        screenObserver = nil
         fpsTimer?.invalidate()
         fpsTimer = nil
-
-        stream?.stopCapture { _ in }
-        stream = nil
-
         metalView?.isPaused = true
+        metalView?.delegate = nil
         outputWindow?.orderOut(nil)
         outputWindow = nil
         metalView = nil
+    }
 
+    private func observeOutputDisplay(generation token: UInt64) {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.generation == token, !self.isStopping else { return }
+            guard let screen = NSScreen.screens.first(where: {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == self.outputDisplayID
+            }) else {
+                let error = SpatialRendererError.outputDisplayNotFound
+                if self.startupTask != nil {
+                    self.startupFailure = error
+                } else if self.isRunning {
+                    self.stop { [weak self] in
+                        guard let self, self.generation == token &+ 1, !self.isStopping else { return }
+                        self.onFailure?(error)
+                    }
+                }
+                return
+            }
+            self.outputWindow?.setFrame(screen.frame, display: true)
+            self.metalView?.frame = CGRect(origin: .zero, size: screen.frame.size)
+        }
+    }
+
+    private func register(_ stream: SCStream, slot: Int) {
         frameLock.lock()
-        currentPixelBuffer = nil
+        streamSlots[ObjectIdentifier(stream)] = slot
         frameLock.unlock()
     }
 
-    // MARK: - Metal Setup
+    private func clearFrames() {
+        frameLock.lock()
+        streamSlots.removeAll()
+        currentPixelBuffers = [nil, nil, nil]
+        frameLock.unlock()
+    }
+
+    @MainActor private func closeCaptures() async {
+        let closing = streams
+        streams.removeAll()
+        clearFrames() // Reject late callbacks before stopping any capture.
+        for stream in closing {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                stream.stopCapture { _ in continuation.resume() }
+            }
+            try? stream.removeStreamOutput(self, type: .screen)
+        }
+    }
 
     private func setupMetal() -> Bool {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
@@ -167,13 +272,23 @@ final class SpatialRenderer: NSObject, ObservableObject {
             return false
         }
 
+        let fallback = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
+        fallback.storageMode = .shared
+        guard let black = device.makeTexture(descriptor: fallback) else { return false }
+        var pixel: UInt32 = 0xFF000000
+        black.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                      withBytes: &pixel, bytesPerRow: 4)
+        blackTexture = black
         return true
     }
 
     // MARK: - Output Window
 
     private func setupOutputWindow() -> Bool {
-        guard let xrealScreen = findXRealScreen() else {
+        guard let xrealScreen = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == outputDisplayID
+        }) else {
             print("[Renderer] No XReal Air screen found")
             return false
         }
@@ -186,7 +301,7 @@ final class SpatialRenderer: NSObject, ObservableObject {
         metalView.framebufferOnly = true
         metalView.preferredFramesPerSecond = 60
         metalView.colorPixelFormat = .bgra8Unorm
-        metalView.isPaused = false
+        metalView.isPaused = true
         metalView.enableSetNeedsDisplay = false
 
         // KeyableBorderlessWindow overrides canBecomeKey/Main → true so MTKView
@@ -222,211 +337,129 @@ final class SpatialRenderer: NSObject, ObservableObject {
         return true
     }
 
-    private func findXRealScreen() -> NSScreen? {
-        // Match NSScreen to XReal Air display by CGDirectDisplayID
-        if let xrealDisplayID = DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: virtualDisplayID) {
-            for screen in NSScreen.screens {
-                if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
-                   screenNumber == xrealDisplayID {
-                    return screen
-                }
-            }
-        }
-
-        // Fallback: first external non-builtin screen that isn't our virtual display
-        for screen in NSScreen.screens {
-            if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
-                if CGDisplayIsBuiltin(screenNumber) == 0 && screenNumber != virtualDisplayID {
-                    return screen
-                }
-            }
-        }
-
-        return nil
-    }
-
-    // MARK: - Screen Capture
-
-    private func startCapture() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first(where: { $0.displayID == virtualDisplayID }) else {
-            os_log("virtual display %u not in SCShareableContent (%d available)",
-                   log: renderLog, type: .error, virtualDisplayID, content.displays.count)
-            throw SpatialRendererError.displayNotFound
-        }
-
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-
-        let config = SCStreamConfiguration()
-        config.width = canvasWidth
-        config.height = canvasHeight
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.queueDepth = 3
-        config.showsCursor = true
-
-        stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        try await stream?.startCapture()
-    }
-
-    // MARK: - FPS Counter
-
-    private func startFPSCounter() {
-        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.fps = self.frameCount
-            self.frameCount = 0
-        }
-    }
 }
-
-// MARK: - SCStreamOutput
 
 extension SpatialRenderer: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
-
-        // SCK delivers both real frames (status `.complete`, with a pixel
-        // buffer) and status-only buffers (`.idle`, `.blank`, `.suspended`)
-        // when the captured content isn't changing. An empty virtual display
-        // produces only status-only buffers, so we must skip them rather than
-        // assume every callback carries a frame.
-        let statusKey = SCStreamFrameInfo.status.rawValue as CFString
+        let key = SCStreamFrameInfo.status.rawValue as CFString
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
-        let status: SCFrameStatus = (attachments?.first?[statusKey] as? Int).flatMap(SCFrameStatus.init(rawValue:)) ?? .complete
-
-        guard status == .complete, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
+        let status = (attachments?.first?[key] as? Int).flatMap(SCFrameStatus.init(rawValue:)) ?? .complete
+        guard status == .complete, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         frameLock.lock()
-        currentPixelBuffer = pixelBuffer
+        if let slot = streamSlots[ObjectIdentifier(stream)] { currentPixelBuffers[slot] = buffer }
         frameLock.unlock()
     }
 }
 
-// MARK: - SCStreamDelegate
-
 extension SpatialRenderer: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("[Renderer] Stream stopped: \(error)")
         DispatchQueue.main.async { [weak self] in
-            self?.isRunning = false
+            guard let self, !self.isStopping,
+                  self.streams.contains(where: { $0 === stream }) else { return }
+            if self.startupTask != nil {
+                self.startupFailure = error
+            } else if self.isRunning {
+                self.stop { [weak self] in self?.onFailure?(error) }
+            }
         }
     }
 }
-
-// MARK: - MTKViewDelegate
 
 extension SpatialRenderer: MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let drawable = view.currentDrawable,
-              let descriptor = view.currentRenderPassDescriptor else { return }
-
-        // Get latest captured frame
-        frameLock.lock()
-        let pixelBuffer = currentPixelBuffer
-        frameLock.unlock()
-
-        // Until the first complete frame arrives, draw a dark-grey background
-        // so the user can tell the renderer is alive even if SCK is only
-        // delivering "idle" status buffers (which happens on a brand-new
-        // virtual display with nothing on it yet).
-        guard let pixelBuffer else {
-            descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1)
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
-            encoder.endEncoding()
-            commandBuffer.present(drawable)
-            commandBuffer.commit()
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self, weak view] in
+                if let view { self?.draw(in: view) }
+            }
             return
         }
+        guard isRunning, view === metalView,
+              let drawable = view.currentDrawable,
+              let descriptor = view.currentRenderPassDescriptor,
+              let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        frameLock.lock()
+        let buffers = currentPixelBuffers
+        frameLock.unlock()
 
-        // Zero-copy: create MTLTexture from pixel buffer via CVMetalTextureCache
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-
-        var cvTexture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            nil, textureCache, pixelBuffer, nil,
-            .bgra8Unorm, width, height, 0, &cvTexture
-        )
-
-        guard status == kCVReturnSuccess,
-              let cvTex = cvTexture,
-              let texture = CVMetalTextureGetTexture(cvTex) else { return }
-
-        if mipTexture == nil || mipTexture!.width != width || mipTexture!.height != height {
-            let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: true)
-            desc.usage = [.shaderRead, .renderTarget]
-            desc.storageMode = .private
-            mipTexture = metalDevice.makeTexture(descriptor: desc)
-        }
-        guard let mipTexture else { return }
-
-        // Compute uniforms from tracker state + screen geometry.
-        let state = spatialTracker.state
-
-        // Diagonal inches → physical extents in meters (16:9).
-        let diagMeters = screenDiagonalInches * 0.0254
-        let aspectNorm = Float((16.0 * 16.0 + 9.0 * 9.0).squareRoot())
-        let halfW = diagMeters * 16.0 / aspectNorm / 2.0
-        let halfH = diagMeters * 9.0 / aspectNorm / 2.0
-
-        // Lean-zoom brings the screen closer instead of cropping pixels.
-        let distance = screenDistanceMeters / Float(state.zoomLevel)
-
-        var uniforms = FloatingUniforms(
-            headMatrix: state.headMatrix,
-            tanHalfFov: SIMD2<Float>(tanHalfFovX, tanHalfFovY),
-            screenHalfSize: SIMD2<Float>(halfW, halfH),
-            distance: distance
-        )
-
-        // Render
-        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
-
-        // Copy the captured frame into the mip chain and regenerate levels.
-        if let blit = commandBuffer.makeBlitCommandEncoder() {
-            blit.copy(from: texture, sourceSlice: 0, sourceLevel: 0,
+        var wrappers: [CVMetalTexture] = []
+        var validMask: UInt32 = 0
+        var textures: [MTLTexture?] = [nil, nil, nil]
+        for slot in virtualDisplayIDs.indices {
+            guard let buffer = buffers[slot] else { continue }
+            let width = CVPixelBufferGetWidth(buffer)
+            let height = CVPixelBufferGetHeight(buffer)
+            var wrapper: CVMetalTexture?
+            let result = CVMetalTextureCacheCreateTextureFromImage(
+                nil, textureCache, buffer, nil, .bgra8Unorm, width, height, 0, &wrapper)
+            guard result == kCVReturnSuccess, let wrapper,
+                  let source = CVMetalTextureGetTexture(wrapper) else { continue }
+            if mipTextures[slot]?.width != width || mipTextures[slot]?.height != height {
+                let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: true)
+                textureDescriptor.usage = [.shaderRead, .renderTarget]
+                textureDescriptor.storageMode = .private
+                mipTextures[slot] = metalDevice.makeTexture(descriptor: textureDescriptor)
+            }
+            guard let texture = mipTextures[slot],
+                  let blit = commandBuffer.makeBlitCommandEncoder() else { continue }
+            blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
                       sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                       sourceSize: MTLSize(width: width, height: height, depth: 1),
-                      to: mipTexture, destinationSlice: 0, destinationLevel: 0,
+                      to: texture, destinationSlice: 0, destinationLevel: 0,
                       destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-            blit.generateMipmaps(for: mipTexture)
+            blit.generateMipmaps(for: texture)
             blit.endEncoding()
+            wrappers.append(wrapper)
+            textures[slot] = texture
+            validMask |= 1 << UInt32(slot)
         }
 
+        let state = spatialTracker.state
+        let diagonal = max(1, screenDiagonalInches) * 0.0254
+        let aspectNorm = Float((16.0 * 16.0 + 9.0 * 9.0).squareRoot())
+        var uniforms = FloatingUniforms(
+            headMatrix: state.headMatrix,
+            optics: SIMD4<Float>(0.369, 0.369 * 9 / 16,
+                                 diagonal * 8 / aspectNorm, diagonal * 4.5 / aspectNorm),
+            layout: SIMD4<Float>(max(0.1, screenDistanceMeters) / max(0.1, Float(state.zoomLevel)),
+                                 32 * .pi / 180, 0.025, 0),
+            configuration: SIMD4<UInt32>(UInt32(virtualDisplayIDs.count), validMask, 0, 0))
+        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
-
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setFragmentTexture(mipTexture, index: 0)
+        for slot in 0..<3 { encoder.setFragmentTexture(textures[slot] ?? blackTexture, index: slot) }
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FloatingUniforms>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
-
+        // Metal retains its textures, but not the CV wrappers/IOSurface owners.
+        commandBuffer.addCompletedHandler { _ in
+            withExtendedLifetime(buffers) {}
+            withExtendedLifetime(wrappers) {}
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
-
         frameCount += 1
     }
 }
 
-// MARK: - Errors
+enum SpatialRendererError: LocalizedError {
+    case displayNotFound, outputDisplayNotFound, metalSetupFailed, invalidConfiguration, sessionBusy
 
-enum SpatialRendererError: Error {
-    case displayNotFound
+    var errorDescription: String? {
+        switch self {
+        case .displayNotFound: return "A virtual monitor is unavailable for screen capture."
+        case .outputDisplayNotFound: return "The selected XREAL glasses display is no longer connected."
+        case .metalSetupFailed: return "Metal could not initialize the spatial renderer."
+        case .invalidConfiguration: return "Spatial mode requires one to three distinct virtual monitors and a separate glasses display."
+        case .sessionBusy: return "The previous spatial renderer is still starting or stopping."
+        }
+    }
 }
 
-// MARK: - KeyableBorderlessWindow
-
-/// Borderless NSWindow that can become key/main. Required on macOS 26 Tahoe so
-/// MTKView receives active display-link callbacks; without this override the
-/// fragment shader runs once and then idles, leaving a black panel.
+/// Tahoe requires a keyable borderless window to keep display-link rendering active.
 private final class KeyableBorderlessWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }

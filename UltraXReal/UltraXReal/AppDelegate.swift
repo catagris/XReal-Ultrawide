@@ -1,7 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let displayManager = VirtualDisplayManager()
     private let settings = Settings.shared
@@ -10,9 +10,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var imuService: XRealIMUService?
     private var spatialTracker: SpatialTracker?
     private var spatialRenderer: SpatialRenderer?
-    private var isSpatialActive = false
+    private var isSpatialActive: Bool { sessionPhase == .running }
     private var recenterHotKeyRef: EventHotKeyRef?
     private var hotkeyEventHandler: EventHandlerRef?
+    private enum SessionPhase { case idle, starting, running, stopping }
+    private var sessionPhase: SessionPhase = .idle
+    private var spatialRequested = false
+    private var sessionGeneration = UUID()
+    private var sessionError: String?
+    private var shutdownCallbacks: [() -> Void] = []
+    private var sleeping = false
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -23,6 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupRecenterHotkey()
+        observeSleepWake()
         buildMenu()
 
         // Restore previous state
@@ -36,16 +45,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if isSpatialActive {
-            disableSpatialMode()
-        }
+        displayManager.restoreMainDisplay()
+        spatialRenderer?.stop()
+        imuService?.stop()
+        if let recenterHotKeyRef { UnregisterEventHotKey(recenterHotKeyRef) }
+        if let hotkeyEventHandler { RemoveEventHandler(hotkeyEventHandler) }
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
     }
 
-    private func buildMenu() {
-        let menu = NSMenu()
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        buildMenu(into: menu)
+    }
+
+    private func buildMenu(into existingMenu: NSMenu? = nil) {
+        let menu = existingMenu ?? NSMenu()
+        menu.removeAllItems()
+        menu.delegate = self
+        menu.autoenablesItems = false
 
         // --- Mode Section ---
-        let imuAvailable = XRealIMUService.isDeviceAvailable()
+        // USB interfaces can briefly disappear during topology changes. Let
+        // the IMU reconnect loop handle detection; do not reset HID from a menu.
+        let glassesAvailable = findGlassesDisplay() != nil
 
         // Static mode toggle
         let staticTitle = (displayManager.isActive && !isSpatialActive) ? "Disable Ultrawide" : "Enable Ultrawide (Static)"
@@ -57,15 +78,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(staticItem)
 
         // Spatial mode toggle
-        let spatialTitle = isSpatialActive ? "Disable Floating Screen" : "Enable Floating Screen"
+        let spatialTitle = spatialRequested ? "Disable Floating Screens" : "Enable Floating Screens"
         let spatialItem = NSMenuItem(title: spatialTitle, action: #selector(toggleSpatialDisplay), keyEquivalent: "s")
         spatialItem.target = self
         if isSpatialActive {
             spatialItem.state = .on
         }
-        if !imuAvailable && !isSpatialActive {
+        if !glassesAvailable && !spatialRequested {
             spatialItem.isEnabled = false
-            spatialItem.toolTip = "Connect XReal Air via USB-C to enable spatial mode (IMU not detected)"
+            spatialItem.toolTip = "Connect XReal Air as an extended display to enable spatial mode."
         }
         menu.addItem(spatialItem)
 
@@ -84,13 +105,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let resItem = NSMenuItem(title: "Resolution", action: nil, keyEquivalent: "")
         resItem.submenu = resMenu
-        resItem.isEnabled = !isSpatialActive  // Disabled during spatial mode
+        resItem.isEnabled = !spatialRequested && sessionPhase == .idle
         menu.addItem(resItem)
 
         // Mirror (static mode only)
         let mirrorItem = NSMenuItem(title: "Mirror to XReal Air", action: #selector(mirrorToXReal), keyEquivalent: "")
         mirrorItem.target = self
-        mirrorItem.isEnabled = displayManager.isActive && !isSpatialActive
+        mirrorItem.isEnabled = displayManager.isActive && !spatialRequested && sessionPhase == .idle
         menu.addItem(mirrorItem)
 
         // Bring cursor onto the virtual display. In spatial mode the renderer
@@ -117,6 +138,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         spatialMenu.addItem(recenterItem)
 
         spatialMenu.addItem(NSMenuItem.separator())
+
+        let countMenu = NSMenu()
+        for count in SpatialMonitorCount.allCases {
+            let item = NSMenuItem(title: "\(count.rawValue)", action: #selector(changeMonitorCount(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = count.rawValue
+            item.state = settings.monitorCount == count ? .on : .off
+            countMenu.addItem(item)
+        }
+        let countItem = NSMenuItem(title: "Monitor Count", action: nil, keyEquivalent: "")
+        countItem.submenu = countMenu
+        spatialMenu.addItem(countItem)
+
+        let mainMenu = NSMenu()
+        for index in -1..<settings.monitorCount.rawValue {
+            let title = index == -1 ? "Original Display" : settings.monitorCount.names[index]
+            let item = NSMenuItem(title: title, action: #selector(changeMainMonitor(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = index
+            item.state = settings.mainMonitorIndex == index ? .on : .off
+            mainMenu.addItem(item)
+        }
+        let mainItem = NSMenuItem(title: "Main Display", action: nil, keyEquivalent: "")
+        mainItem.submenu = mainMenu
+        spatialMenu.addItem(mainItem)
 
         // Screen size + distance sliders (TV-style, live while wearing)
         let sizeSliderItem = NSMenuItem()
@@ -207,7 +253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             if let id = displayManager.currentDisplayID {
                 let res = settings.spatialResolution
-                let canvasItem = NSMenuItem(title: "Monitor: \(res.width)x\(res.height) (ID: \(id))", action: nil, keyEquivalent: "")
+                let canvasItem = NSMenuItem(title: "\(displayManager.spatialDisplayIDs.count) monitors: \(res.width)×\(res.height) (center ID: \(id))", action: nil, keyEquivalent: "")
                 canvasItem.isEnabled = false
                 menu.addItem(canvasItem)
             }
@@ -224,7 +270,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(NSMenuItem.separator())
         }
 
-        if let error = displayManager.lastError {
+        if let error = sessionError ?? displayManager.lastError {
             let errorItem = NSMenuItem(title: error, action: nil, keyEquivalent: "")
             errorItem.isEnabled = false
             menu.addItem(errorItem)
@@ -232,8 +278,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if !displayManager.isActive {
-            let imuStatus = imuAvailable ? "IMU detected" : "IMU not detected"
-            let tipItem = NSMenuItem(title: "Tip: Connect XReal Air via USB-C (\(imuStatus))", action: nil, keyEquivalent: "")
+            let tipItem = NSMenuItem(title: glassesAvailable ? "XReal display detected" : "Connect XReal Air as an extended display", action: nil, keyEquivalent: "")
             tipItem.isEnabled = false
             menu.addItem(tipItem)
             menu.addItem(NSMenuItem.separator())
@@ -252,147 +297,209 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    // MARK: - Static Mode Actions
+    // MARK: - Session lifecycle
 
     @objc private func toggleStaticDisplay() {
-        // If spatial is active, disable it first
-        if isSpatialActive {
-            disableSpatialMode()
-        }
-
-        if displayManager.isActive {
-            if let xrealID = DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: displayManager.currentDisplayID) {
-                DisplayMirrorHelper.unmirror(displayID: xrealID)
-            }
+        if spatialRequested || sessionPhase != .idle {
+            disableSpatialMode { [weak self] in self?.enableStaticDisplay() }
+        } else if displayManager.isActive {
             displayManager.disable()
             settings.displayWasEnabled = false
             settings.spatialMode = false
+            updateIcon()
+            buildMenu()
         } else {
-            displayManager.enable(resolution: settings.selectedResolution)
-            settings.displayWasEnabled = true
-            settings.spatialMode = false
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.autoMirrorToXReal()
-            }
+            enableStaticDisplay()
         }
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.updateIcon()
-            self?.buildMenu()
+    private func enableStaticDisplay() {
+        guard sessionPhase == .idle, !spatialRequested else { return }
+        displayManager.enable(resolution: settings.selectedResolution)
+        settings.displayWasEnabled = true
+        settings.spatialMode = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, !self.spatialRequested, self.sessionPhase == .idle else { return }
+            self.autoMirrorToXReal()
+            self.updateIcon()
+            self.buildMenu()
         }
     }
 
     private func autoMirrorToXReal() {
-        guard let virtualID = displayManager.currentDisplayID else { return }
-        if let xrealID = DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: virtualID) {
-            let success = DisplayMirrorHelper.mirror(virtualDisplayID: virtualID, onto: xrealID)
-            if success {
-                print("Auto-mirrored virtual display \(virtualID) to XReal Air \(xrealID)")
-            } else {
-                print("Failed to auto-mirror to XReal Air")
-            }
-        } else {
-            print("XReal Air display not found — use Mirror to XReal Air manually")
+        guard !spatialRequested, let virtualID = displayManager.currentDisplayID,
+              let outputID = findGlassesDisplay() else { return }
+        if !DisplayMirrorHelper.mirror(virtualDisplayID: virtualID, onto: outputID) {
+            sessionError = "Could not mirror the static display to XReal Air."
         }
     }
 
-    // MARK: - Spatial Mode Actions
-
     @objc private func toggleSpatialDisplay() {
-        if isSpatialActive {
-            disableSpatialMode()
-        } else {
-            // If static mode is active, disable it first
-            if displayManager.isActive {
-                if let xrealID = DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: displayManager.currentDisplayID) {
-                    DisplayMirrorHelper.unmirror(displayID: xrealID)
-                }
-                displayManager.disable()
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    self?.enableSpatialMode()
-                }
-            } else {
-                enableSpatialMode()
-            }
-        }
+        if spatialRequested { disableSpatialMode() } else { enableSpatialMode() }
     }
 
     private func enableSpatialMode() {
-        // 1. Create the floating monitor's virtual display
-        let res = settings.spatialResolution
-        displayManager.enableSpatialCanvas(width: res.width, height: res.height)
+        spatialRequested = true
+        settings.displayWasEnabled = true
+        settings.spatialMode = true
+        startSpatialSessionIfPossible()
+    }
 
-        // 2. Wait for display, then set up the spatial pipeline
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self, let virtualID = self.displayManager.currentDisplayID else {
-                print("[Spatial] Failed — virtual display not created")
-                return
-            }
+    private func startSpatialSessionIfPossible() {
+        guard spatialRequested, !sleeping, sessionPhase == .idle else { return }
+        guard let outputID = findGlassesDisplay() else {
+            failSpatialSession("Connect XReal Air as an extended display before enabling floating screens.")
+            return
+        }
+        sessionPhase = .starting
+        sessionError = nil
+        let token = UUID()
+        sessionGeneration = token
+        // Resolve glasses before creating 1080p virtual monitors.
+        _ = DisplayMirrorHelper.unmirror(displayID: outputID)
+        // Drain even an unpublished static startup before reusing display serials.
+        displayManager.disable { [weak self] in
+            guard let self, self.sessionGeneration == token else { return }
+            self.createSpatialSession(outputID: outputID, token: token)
+        }
+        buildMenu()
+    }
 
-            // Unmirror XReal Air — spatial mode renders directly
-            if let xrealID = DisplayMirrorHelper.findXRealDisplay(excludingDisplayID: virtualID) {
-                DisplayMirrorHelper.unmirror(displayID: xrealID)
-            }
-
-            // 3. Start IMU
-            let imu = XRealIMUService()
-            imu.start()
-            self.imuService = imu
-
-            // 4. Start spatial tracker
-            let tracker = SpatialTracker(imuService: imu)
-            tracker.smoothing = self.settings.spatialSmoothing
-            tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
-            tracker.followModeEnabled = self.settings.followModeEnabled
-            self.spatialTracker = tracker
-
-            // 5. Start renderer
-            let renderer = SpatialRenderer(
-                virtualDisplayID: virtualID,
-                spatialTracker: tracker,
-                canvasWidth: Int(res.width),
-                canvasHeight: Int(res.height)
-            )
-            renderer.screenDiagonalInches = Float(self.settings.screenInches)
-            renderer.screenDistanceMeters = Float(self.settings.screenDistance)
-            renderer.start()
-            self.spatialRenderer = renderer
-
-            self.isSpatialActive = true
-            self.settings.displayWasEnabled = true
-            self.settings.spatialMode = true
-
-            self.updateIcon()
-            self.buildMenu()
-
-            // Auto-recenter after a short delay, then warp the cursor onto the
-            // virtual display so the user can interact with what they see in
-            // the glasses without first navigating the cursor manually.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                tracker.recenter()
-                self?.warpCursorToVirtualDisplay()
+    private func createSpatialSession(outputID: CGDirectDisplayID, token: UUID) {
+        let resolution = settings.spatialResolution
+        displayManager.enableSpatialMonitors(count: settings.monitorCount.rawValue,
+                                             width: resolution.width, height: resolution.height) { [weak self] result in
+            guard let self, self.sessionGeneration == token, self.spatialRequested else { return }
+            switch result {
+            case .failure(let error):
+                self.failSpatialSession(error.localizedDescription)
+            case .success(let ids):
+                guard DisplayMirrorHelper.unmirror(displayID: outputID) else {
+                    self.failSpatialSession("Could not extend the glasses display.")
+                    return
+                }
+                let imu = XRealIMUService()
+                let tracker = SpatialTracker(imuService: imu)
+                tracker.smoothing = self.settings.spatialSmoothing
+                tracker.leanToZoomEnabled = self.settings.leanToZoomEnabled
+                tracker.followModeEnabled = self.settings.followModeEnabled
+                self.imuService = imu
+                self.spatialTracker = tracker
+                let renderer = SpatialRenderer(virtualDisplayIDs: ids, outputDisplayID: outputID,
+                                               spatialTracker: tracker, canvasWidth: Int(resolution.width),
+                                               canvasHeight: Int(resolution.height))
+                renderer.screenDiagonalInches = Float(self.settings.screenInches)
+                renderer.screenDistanceMeters = Float(self.settings.screenDistance)
+                renderer.onFailure = { [weak self] error in
+                    guard let self, self.sessionGeneration == token else { return }
+                    self.failSpatialSession(error.localizedDescription)
+                }
+                self.spatialRenderer = renderer
+                imu.start()
+                renderer.start { [weak self] result in
+                    guard let self, self.sessionGeneration == token, self.spatialRequested else { return }
+                    switch result {
+                    case .success:
+                        self.sessionPhase = .running
+                        self.applyMainMonitor()
+                        self.warpCursorToVirtualDisplay()
+                        self.updateIcon()
+                        self.buildMenu()
+                    case .failure(let error):
+                        self.failSpatialSession(error.localizedDescription)
+                    }
+                }
             }
         }
     }
 
-    private func disableSpatialMode() {
-        spatialRenderer?.stop()
-        spatialRenderer = nil
-        spatialTracker = nil
-        imuService?.stop()
-        imuService = nil
+    private func failSpatialSession(_ message: String) {
+        sessionError = message
+        disableSpatialMode()
+    }
 
-        displayManager.disable()
-        isSpatialActive = false
+    private func disableSpatialMode(completion: (() -> Void)? = nil) {
+        spatialRequested = false
         settings.displayWasEnabled = false
         settings.spatialMode = false
+        stopSpatialSession(completion: completion)
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.updateIcon()
-            self?.buildMenu()
+    private func stopSpatialSession(completion: (() -> Void)? = nil) {
+        if let completion { shutdownCallbacks.append(completion) }
+        guard sessionPhase != .stopping else { return }
+        sessionPhase = .stopping
+        sessionGeneration = UUID()
+        let oldRenderer = spatialRenderer
+        let oldIMU = imuService
+        spatialRenderer = nil
+        spatialTracker = nil
+        imuService = nil
+        oldRenderer?.onFailure = nil
+        let finish: () -> Void = { [weak self] in
+            oldIMU?.stop()
+            guard let self else { return }
+            self.displayManager.disable { [weak self] in
+                guard let self else { return }
+                self.sessionPhase = .idle
+                let callbacks = self.shutdownCallbacks
+                self.shutdownCallbacks.removeAll()
+                self.updateIcon()
+                self.buildMenu()
+                callbacks.forEach { $0() }
+                self.startSpatialSessionIfPossible()
+            }
         }
+        if let oldRenderer { oldRenderer.stop(completion: finish) } else { finish() }
+        updateIcon()
+        buildMenu()
+    }
+
+    private func restartSpatialSession() {
+        if spatialRequested { stopSpatialSession() } else { buildMenu() }
+    }
+
+    private func applyMainMonitor() {
+        guard sessionPhase == .running else { return }
+        let index = settings.mainMonitorIndex
+        if index == -1 {
+            displayManager.restoreMainDisplay()
+        } else if displayManager.spatialDisplayIDs.indices.contains(index) {
+            if !displayManager.makeMainDisplay(displayManager.spatialDisplayIDs[index]) {
+                sessionError = "Could not change the main display."
+            }
+        }
+    }
+
+    private func findGlassesDisplay() -> CGDirectDisplayID? {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return nil }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return nil }
+        let external = ids.prefix(Int(count)).filter {
+            CGDisplayIsBuiltin($0) == 0 && CGDisplayVendorNumber($0) != 0x1234
+        }
+        if let known = external.first(where: { [13895, 10462, 7531].contains(CGDisplayVendorNumber($0)) }) {
+            return known
+        }
+        let candidates = external.filter { CGDisplayPixelsWide($0) == 1920 && CGDisplayPixelsHigh($0) == 1080 }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    private func observeSleepWake() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification,
+                                                     object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.sleeping = true
+            if self.spatialRequested { self.stopSpatialSession() }
+        })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                     object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.sleeping = false
+            self.startSpatialSessionIfPossible()
+        })
     }
 
     @objc private func recenterSpatial() {
@@ -403,15 +510,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func changeSpatialResolution(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
-              let res = SpatialResolution(rawValue: raw) else { return }
-        settings.spatialResolution = res
-        // Takes effect on next spatial enable; restart if currently active.
-        if isSpatialActive {
-            disableSpatialMode()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.enableSpatialMode()
-            }
-        }
+              let resolution = SpatialResolution(rawValue: raw),
+              resolution != settings.spatialResolution else { return }
+        settings.spatialResolution = resolution
+        restartSpatialSession()
+    }
+
+    @objc private func changeMonitorCount(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? Int,
+              let count = SpatialMonitorCount(rawValue: raw),
+              count != settings.monitorCount else { return }
+        let oldNames = settings.monitorCount.names
+        let oldMainName = oldNames.indices.contains(settings.mainMonitorIndex) ? oldNames[settings.mainMonitorIndex] : nil
+        settings.monitorCount = count
+        settings.mainMonitorIndex = oldMainName.flatMap { count.names.firstIndex(of: $0) } ?? -1
+        restartSpatialSession()
+    }
+
+    @objc private func changeMainMonitor(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int,
+              (-1..<settings.monitorCount.rawValue).contains(index) else { return }
+        settings.mainMonitorIndex = index
+        applyMainMonitor()
         buildMenu()
     }
 
@@ -483,12 +603,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() {
-        if isSpatialActive {
-            disableSpatialMode()
-        } else {
-            displayManager.disable()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        disableSpatialMode {
             NSApplication.shared.terminate(nil)
         }
     }
