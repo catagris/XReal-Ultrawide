@@ -11,6 +11,7 @@ struct SpatialState {
 
 /// Persistent base zoom, independent of optional lean-to-zoom magnification.
 enum SpatialZoom: Double, CaseIterable {
+    case fortyPercent = 0.4
     case fiftyPercent = 0.5
     case seventyFivePercent = 0.75
     case oneHundredPercent = 1.0
@@ -22,12 +23,12 @@ enum SpatialZoom: Double, CaseIterable {
 enum SpatialSensitivity: String, CaseIterable, Codable {
     case low, medium, high
 
-    /// Pixels per radian of yaw rotation.
+    /// Output pixels per radian, kept independent of desktop zoom.
     var pixelsPerRadian: CGFloat {
         switch self {
-        case .low: return 400
-        case .medium: return 800
-        case .high: return 1200
+        case .low: return 1200
+        case .medium: return 2000
+        case .high: return 2800
         }
     }
 }
@@ -115,7 +116,7 @@ final class SpatialTracker: ObservableObject {
     }
 
     private func publishState() {
-        // Calculate zoom first because it determines the visible area and pan limits.
+        // Calculate zoom first because it determines the visible area and tracking scale.
         var zoom = CGFloat(baseZoom.rawValue)
         if leanToZoomEnabled {
             let pitchDelta = smoothedPitch - neutralPitch
@@ -125,17 +126,16 @@ final class SpatialTracker: ObservableObject {
             }
         }
 
-        // Move the viewport with the head to reveal the canvas in that direction.
-        let maxOffsetX = max(0, canvasSize.width - viewportSize.width / zoom)
-        let maxOffsetY = max(0, canvasSize.height - viewportSize.height / zoom)
-        let centerX = maxOffsetX / 2
-        let centerY = maxOffsetY / 2
+        // Keep the desktop centered at rest, including when it is smaller than the view.
+        let centerX = (canvasSize.width - viewportSize.width / zoom) / 2
+        let centerY = (canvasSize.height - viewportSize.height / zoom) / 2
 
-        var offsetX = centerX + (smoothedYaw * sensitivity.pixelsPerRadian)
-        var offsetY = centerY - (smoothedPitch * sensitivity.pixelsPerRadian)
-
-        offsetX = max(0, min(offsetX, maxOffsetX))
-        offsetY = max(0, min(offsetY, maxOffsetY))
+        // Allow looking beyond the desktop instead of pinning it to the glasses
+        // at an edge. The shader paints space outside the desktop black.
+        // Dividing by zoom keeps apparent head movement consistent at every zoom.
+        let trackingScale = sensitivity.pixelsPerRadian / zoom
+        let offsetX = centerX + smoothedYaw * trackingScale
+        let offsetY = centerY - smoothedPitch * trackingScale
 
         state = SpatialState(
             viewportOffset: CGPoint(x: offsetX, y: offsetY),

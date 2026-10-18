@@ -35,6 +35,12 @@ fragment float4 spatialFragment(
     // Map output texcoord [0,1] to the viewport region on the canvas
     float2 sampleCoord = uniforms.viewportOrigin + in.texCoord * uniforms.viewportSize;
 
+    // A floating desktop has empty space beyond its edges. Clamping the texture
+    // here would stretch edge pixels across that space as the user looks away.
+    if (any(sampleCoord < float2(0.0)) || any(sampleCoord > float2(1.0))) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     return canvasTexture.sample(s, sampleCoord);
 }
