@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import ScreenCaptureKit
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
@@ -13,7 +14,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isSpatialActive: Bool { sessionPhase == .running }
     private var recenterHotKeyRef: EventHotKeyRef?
     private var hotkeyEventHandler: EventHandlerRef?
-    private enum SessionPhase { case idle, starting, running, stopping }
+    private enum SessionPhase { case idle, waitingForPermission, starting, running, stopping }
     private var sessionPhase: SessionPhase = .idle
     private var spatialRequested = false
     private var sessionGeneration = UUID()
@@ -21,6 +22,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var shutdownCallbacks: [() -> Void] = []
     private var sleeping = false
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var permissionTimer: Timer?
+    private var requestedCapturePermission = false
+    private var capturePermissionDenied = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -45,6 +49,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        permissionTimer?.invalidate()
         displayManager.restoreMainDisplay()
         spatialRenderer?.stop()
         imuService?.stop()
@@ -246,7 +251,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
 
         // --- Status info ---
-        if isSpatialActive, let renderer = spatialRenderer {
+        if sessionPhase == .waitingForPermission {
+            let item = NSMenuItem(title: "Waiting for Screen Recording permission…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            let retry = NSMenuItem(title: "Retry After Approving Recording", action: #selector(retryCapturePermission), keyEquivalent: "")
+            retry.target = self
+            menu.addItem(retry)
+            menu.addItem(NSMenuItem.separator())
+        } else if isSpatialActive, let renderer = spatialRenderer {
             let fpsItem = NSMenuItem(title: "Spatial: Active (\(renderer.fps) fps)", action: nil, keyEquivalent: "")
             fpsItem.isEnabled = false
             menu.addItem(fpsItem)
@@ -347,6 +360,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startSpatialSessionIfPossible() {
         guard spatialRequested, !sleeping, sessionPhase == .idle else { return }
+        guard CGPreflightScreenCaptureAccess(), !capturePermissionDenied else {
+            waitForCapturePermission()
+            return
+        }
         guard let outputID = findGlassesDisplay() else {
             failSpatialSession("Connect XReal Air as an extended display before enabling floating screens.")
             return
@@ -394,7 +411,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 renderer.screenDistanceMeters = Float(self.settings.screenDistance)
                 renderer.onFailure = { [weak self] error in
                     guard let self, self.sessionGeneration == token else { return }
-                    self.failSpatialSession(error.localizedDescription)
+                    self.handleCaptureFailure(error)
                 }
                 self.spatialRenderer = renderer
                 imu.start()
@@ -408,11 +425,61 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.updateIcon()
                         self.buildMenu()
                     case .failure(let error):
-                        self.failSpatialSession(error.localizedDescription)
+                        self.handleCaptureFailure(error)
                     }
                 }
             }
         }
+    }
+
+    private func waitForCapturePermission() {
+        sessionPhase = .waitingForPermission
+        sessionError = nil
+        permissionTimer?.invalidate()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self, self.spatialRequested, self.sessionPhase == .waitingForPermission else {
+                timer.invalidate()
+                return
+            }
+            guard CGPreflightScreenCaptureAccess() else {
+                self.capturePermissionDenied = false
+                return
+            }
+            guard !self.capturePermissionDenied else { return }
+            timer.invalidate()
+            self.permissionTimer = nil
+            self.sessionPhase = .idle
+            self.startSpatialSessionIfPossible()
+        }
+        permissionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        buildMenu()
+        if !requestedCapturePermission {
+            requestedCapturePermission = true
+            _ = CGRequestScreenCaptureAccess()
+        }
+    }
+
+    private func handleCaptureFailure(_ error: Error) {
+        let failure = error as NSError
+        if failure.domain == SCStreamErrorDomain && failure.code == SCStreamError.Code.userDeclined.rawValue {
+            capturePermissionDenied = true
+        }
+        if capturePermissionDenied || !CGPreflightScreenCaptureAccess() {
+            // Keep the user's requested session across TCC approval/relaunch.
+            stopSpatialSession()
+        } else {
+            failSpatialSession(error.localizedDescription)
+        }
+    }
+
+    @objc private func retryCapturePermission() {
+        guard spatialRequested, sessionPhase == .waitingForPermission else { return }
+        permissionTimer?.invalidate()
+        permissionTimer = nil
+        capturePermissionDenied = false
+        sessionPhase = .idle
+        startSpatialSessionIfPossible()
     }
 
     private func failSpatialSession(_ message: String) {
@@ -431,6 +498,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func stopSpatialSession(completion: (() -> Void)? = nil) {
         if let completion { shutdownCallbacks.append(completion) }
         guard sessionPhase != .stopping else { return }
+        permissionTimer?.invalidate()
+        permissionTimer = nil
         sessionPhase = .stopping
         sessionGeneration = UUID()
         let oldRenderer = spatialRenderer
