@@ -203,6 +203,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         spatialMenu.addItem(distSliderItem)
 
+        let angleSliderItem = NSMenuItem()
+        angleSliderItem.view = SliderMenuItemView(
+            title: "Monitor Angle",
+            min: 0, max: 75,
+            value: settings.monitorAngleDegrees,
+            format: { String(format: "%.0f°", $0) },
+            onChange: { [weak self] value in
+                self?.settings.monitorAngleDegrees = value
+                self?.spatialRenderer?.monitorAngleDegrees = Float(value)
+            }
+        )
+        angleSliderItem.view?.toolTip = "Inward angle between adjacent monitors. Zero makes a flat row."
+        spatialMenu.addItem(angleSliderItem)
+
+        let gapSliderItem = NSMenuItem()
+        gapSliderItem.view = SliderMenuItemView(
+            title: "Monitor Gap",
+            min: 0, max: 1,
+            value: settings.monitorGapMeters,
+            format: { String(format: "%.1f cm", $0 * 100) },
+            onChange: { [weak self] value in
+                self?.settings.monitorGapMeters = value
+                self?.spatialRenderer?.monitorGapMeters = Float(value)
+            }
+        )
+        spatialMenu.addItem(gapSliderItem)
+
         spatialMenu.addItem(NSMenuItem.separator())
 
         // Floating monitor resolution
@@ -416,6 +443,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                canvasHeight: Int(resolution.height))
                 renderer.screenDiagonalInches = Float(self.settings.screenInches)
                 renderer.screenDistanceMeters = Float(self.settings.screenDistance)
+                renderer.monitorAngleDegrees = Float(self.settings.monitorAngleDegrees)
+                renderer.monitorGapMeters = Float(self.settings.monitorGapMeters)
                 renderer.onFailure = { [weak self] error in
                     guard let self, self.sessionGeneration == token else { return }
                     self.handleCaptureFailure(error)

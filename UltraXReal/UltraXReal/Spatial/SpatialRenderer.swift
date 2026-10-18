@@ -30,6 +30,8 @@ final class SpatialRenderer: NSObject, ObservableObject {
     let canvasHeight: Int
     var screenDiagonalInches: Float = 65
     var screenDistanceMeters: Float = 2
+    var monitorAngleDegrees: Float = 32
+    var monitorGapMeters: Float = 0.025
 
     private var metalDevice: MTLDevice!
     private var commandQueue: MTLCommandQueue!
@@ -425,7 +427,8 @@ extension SpatialRenderer: MTKViewDelegate {
             optics: SIMD4<Float>(0.369, 0.369 * 9 / 16,
                                  diagonal * 8 / aspectNorm, diagonal * 4.5 / aspectNorm),
             layout: SIMD4<Float>(max(0.1, screenDistanceMeters) / max(0.1, Float(state.zoomLevel)),
-                                 32 * .pi / 180, 0.025, 0),
+                                 min(75, max(0, monitorAngleDegrees)) * .pi / 180,
+                                 min(1, max(0, monitorGapMeters)), 0),
             configuration: SIMD4<UInt32>(UInt32(virtualDisplayIDs.count), validMask, 0, 0))
         descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
