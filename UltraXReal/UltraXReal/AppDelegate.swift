@@ -1,5 +1,4 @@
 import AppKit
-import SwiftUI
 import Carbon.HIToolbox
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -12,7 +11,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var spatialTracker: SpatialTracker?
     private var spatialRenderer: SpatialRenderer?
     private var isSpatialActive = false
-    private var globalHotkeyMonitor: Any?
     private var recenterHotKeyRef: EventHotKeyRef?
     private var hotkeyEventHandler: EventHandlerRef?
 
@@ -40,9 +38,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         if isSpatialActive {
             disableSpatialMode()
-        }
-        if let monitor = globalHotkeyMonitor {
-            NSEvent.removeMonitor(monitor)
         }
     }
 

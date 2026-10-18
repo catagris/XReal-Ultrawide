@@ -59,10 +59,6 @@ final class SpatialRenderer: NSObject, ObservableObject {
     private var frameCount = 0
     private var fpsTimer: Timer?
 
-    // Diagnostics — only mutated from the capture queue, no lock needed.
-    private var firstCompleteFrameLogged = false
-    private var lastLoggedStatus: SCFrameStatus?
-
     // Virtual monitor dimensions (pixels, what macOS renders)
     let canvasWidth: Int
     let canvasHeight: Int
@@ -183,7 +179,6 @@ final class SpatialRenderer: NSObject, ObservableObject {
         }
 
         let screenFrame = xrealScreen.frame
-        print("[Renderer] XReal screen frame=\(screenFrame)")
 
         metalView = MTKView(frame: CGRect(origin: .zero, size: screenFrame.size),
                             device: metalDevice)
@@ -301,18 +296,7 @@ extension SpatialRenderer: SCStreamOutput {
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let status: SCFrameStatus = (attachments?.first?[statusKey] as? Int).flatMap(SCFrameStatus.init(rawValue:)) ?? .complete
 
-        if status != lastLoggedStatus {
-            os_log("SCK status=%{public}@", log: renderLog, type: .info, String(describing: status))
-            lastLoggedStatus = status
-        }
-
         guard status == .complete, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-        if !firstCompleteFrameLogged {
-            firstCompleteFrameLogged = true
-            os_log("SCK first complete frame %dx%d", log: renderLog, type: .info,
-                   CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer))
-        }
 
         frameLock.lock()
         currentPixelBuffer = pixelBuffer
@@ -436,8 +420,6 @@ extension SpatialRenderer: MTKViewDelegate {
 
 enum SpatialRendererError: Error {
     case displayNotFound
-    case metalSetupFailed
-    case capturePermissionDenied
 }
 
 // MARK: - KeyableBorderlessWindow
