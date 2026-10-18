@@ -27,6 +27,9 @@ final class XRealIMUService: ObservableObject {
     private var isRunning = false
     private var referenceQuat: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var hasReference = false
+    private let calibrationLock = NSLock()
+    private var calibrationRequest: (id: UUID, completion: (String?) -> Void)?
+    private(set) var isCalibrating = false
 
     // Store a reference to self for the C callback context
     private var callbackContext: UnsafeMutableRawPointer?
@@ -85,6 +88,7 @@ final class XRealIMUService: ObservableObject {
             }
 
             readLoop()
+            finishCalibration(error: "The glasses disconnected before calibration finished.")
 
             // readLoop returned: either stop() was requested or the device
             // unplugged (USB re-enumeration). Close and, if still running, reconnect.
@@ -109,6 +113,7 @@ final class XRealIMUService: ObservableObject {
     func stop() {
         isRunning = false
         callbackContext = nil
+        finishCalibration(error: "Calibration was cancelled.")
 
         DispatchQueue.main.async { [weak self] in
             self?.isConnected = false
@@ -132,10 +137,79 @@ final class XRealIMUService: ObservableObject {
 
     // MARK: - Private
 
+    /// Explicit user-requested calibration; the HID read loop remains the sole device owner.
+    func calibrateGyroscope(completion: @escaping (String?) -> Void) {
+        guard isConnected, !isCalibrating else {
+            completion("Connect the glasses and wait for any current calibration to finish.")
+            return
+        }
+        isCalibrating = true
+        calibrationLock.lock()
+        calibrationRequest = (UUID(), completion)
+        calibrationLock.unlock()
+    }
+
+    private func finishCalibration(id: UUID? = nil, error: String?) {
+        calibrationLock.lock()
+        let request = calibrationRequest
+        if let id, request?.id != id { calibrationLock.unlock(); return }
+        calibrationRequest = nil
+        calibrationLock.unlock()
+        guard let request else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.isCalibrating = false
+            request.completion(error)
+        }
+    }
+
+    private func biasKey(for dev: UnsafeMutablePointer<device_imu_type>) -> String? {
+        guard let serial = dev.pointee.serial_number else { return nil }
+        let serialString = String(cString: serial)
+        guard !serialString.isEmpty else { return nil }
+        return "gyroBias.v1.\(dev.pointee.vendor_id).\(dev.pointee.product_id).\(serialString)"
+    }
+
     private func readLoop() {
         var previousTimestamp: UInt64 = 0
+        var calibrationID: UUID?
+        var calibrationDeadline: TimeInterval = 0
+        if let dev = device, let rawOffset = dev.pointee.offset,
+           let key = biasKey(for: dev), let bias = UserDefaults.standard.array(forKey: key) as? [Double],
+           bias.count == 3, bias.allSatisfy({ $0.isFinite && abs($0) <= 3 }) {
+            FusionOffsetSetBias(rawOffset.assumingMemoryBound(to: FusionOffset.self),
+                                Float(bias[0]), Float(bias[1]), Float(bias[2]))
+        }
         while isRunning, let dev = device {
+            calibrationLock.lock()
+            let requestID = calibrationRequest?.id
+            calibrationLock.unlock()
+            if requestID == nil, calibrationID != nil, let rawOffset = dev.pointee.offset {
+                FusionOffsetCancelCalibration(rawOffset.assumingMemoryBound(to: FusionOffset.self))
+                calibrationID = nil
+            }
+            if let requestID, requestID != calibrationID, let rawOffset = dev.pointee.offset {
+                calibrationID = requestID
+                calibrationDeadline = ProcessInfo.processInfo.systemUptime + 5
+                FusionOffsetBeginCalibration(rawOffset.assumingMemoryBound(to: FusionOffset.self))
+            }
             let err = device_imu_read(dev, 16) // 16ms timeout ≈ 60Hz
+
+            if let calibrationID, requestID == calibrationID, let rawOffset = dev.pointee.offset {
+                let offset = rawOffset.assumingMemoryBound(to: FusionOffset.self)
+                let status = FusionOffsetGetCalibrationState(offset)
+                if status == FusionOffsetCalibrationComplete {
+                    let bias = FusionOffsetGetBias(offset)
+                    if let key = biasKey(for: dev) {
+                        UserDefaults.standard.set([Double(bias.axis.x), Double(bias.axis.y), Double(bias.axis.z)], forKey: key)
+                    }
+                    finishCalibration(id: calibrationID, error: nil)
+                } else if status == FusionOffsetCalibrationMoved {
+                    finishCalibration(id: calibrationID, error: "Movement was detected. Rest the glasses on a stable surface and try again.")
+                } else if ProcessInfo.processInfo.systemUptime > calibrationDeadline {
+                    FusionOffsetCancelCalibration(offset)
+                    finishCalibration(id: calibrationID, error: "The sensor did not provide enough samples. Reconnect the glasses and retry.")
+                }
+            }
 
             if err == DEVICE_IMU_ERROR_UNPLUGGED {
                 print("[IMU] Device unplugged")

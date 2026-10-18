@@ -143,6 +143,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recenterItem.isEnabled = isSpatialActive
         spatialMenu.addItem(recenterItem)
 
+        let calibrationItem = NSMenuItem(title: imuService?.isCalibrating == true ? "Calibrating — Keep Glasses Still" : "Calibrate Gyroscope…",
+                                         action: #selector(calibrateGyroscope), keyEquivalent: "")
+        calibrationItem.target = self
+        calibrationItem.isEnabled = isSpatialActive && imuService?.isConnected == true && imuService?.isCalibrating == false
+        spatialMenu.addItem(calibrationItem)
+
         spatialMenu.addItem(NSMenuItem.separator())
 
         let countMenu = NSMenu()
@@ -581,6 +587,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func recenterSpatial() {
         spatialTracker?.recenter()
+    }
+
+    @objc private func calibrateGyroscope() {
+        guard isSpatialActive, let imu = imuService, !imu.isCalibrating else { return }
+        let prompt = NSAlert()
+        prompt.messageText = "Calibrate Gyroscope"
+        prompt.informativeText = "Rest the glasses on a stable surface. Keep them completely still for two seconds after starting. The correction is saved for these glasses."
+        prompt.addButton(withTitle: "Start Calibration")
+        prompt.addButton(withTitle: "Cancel")
+        guard prompt.runModal() == .alertFirstButtonReturn else { return }
+        imu.calibrateGyroscope { [weak self, weak imu] error in
+            guard let self, let imu, self.imuService === imu else { return }
+            self.buildMenu()
+            let result = NSAlert()
+            result.messageText = error == nil ? "Gyroscope Calibrated" : "Calibration Failed"
+            result.informativeText = error ?? "Put the glasses back on, face forward, then press Cmd+Shift+R to recenter. Recalibrate if drift returns as the glasses warm up."
+            result.runModal()
+        }
+        buildMenu()
     }
 
     // MARK: - Spatial Settings Actions
