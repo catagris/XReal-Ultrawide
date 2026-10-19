@@ -7,8 +7,8 @@
   <img src="https://img.shields.io/badge/Swift-5.9-orange" alt="Swift">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
   <br><br>
-  <a href="https://github.com/DannyDesert/XReal-Ultrawide/releases/latest/download/UltraXReal-v2.0.0.dmg">
-    <img src="https://img.shields.io/github/v/release/DannyDesert/XReal-Ultrawide?label=Download%20DMG&color=brightgreen&style=for-the-badge" alt="Download DMG">
+  <a href="https://github.com/catagris/XReal-Ultrawide/releases/tag/v2.1.0-beta.1">
+    <img src="https://img.shields.io/badge/Download-v2.1.0--beta.1-orange?style=for-the-badge" alt="Download prerelease">
   </a>
 </p>
 
@@ -37,22 +37,30 @@ The display floats in space. Turn your head and it stays put. Lean forward to zo
 
 ## Install
 
-### Homebrew (recommended)
+### Fork prerelease (recommended for testing these fixes)
+
+Download **[UltraXReal v2.1.0-beta.1](https://github.com/catagris/XReal-Ultrawide/releases/tag/v2.1.0-beta.1)**. The ZIP contains a universal app for Apple silicon and Intel Macs running macOS 13 or later, plus installation instructions. This prerelease includes independent floating monitors, layout controls, viewport recovery, and stationary gyro drift correction.
+
+1. Quit any running copy of UltraXReal, unzip the download, and drag `UltraXReal.app` to Applications.
+2. Open the app. It is **ad hoc signed and not notarized**. If macOS blocks it, open **System Settings > Privacy & Security**, find the blocked-app notice, and choose **Open Anyway**. See [Apple's instructions](https://support.apple.com/en-us/102445).
+3. Grant Screen Recording access when prompted, then quit and reopen the app if requested. UltraXReal lives in the menu bar.
+
+The release includes `SHA256SUMS.txt` for verifying the download. Long-term drift, sleep/wake recovery, and different glasses/macOS combinations still need wider testing. Tracking is rotational; positional tracking is not included.
+
+### Upstream Homebrew release
+
+These commands install the upstream release rather than this fork's prerelease:
 
 ```bash
 brew tap DannyDesert/ultraxreal
 brew install --cask ultraxreal
 ```
 
-### Direct Download
+### Upstream Direct Download
 
 **[Download UltraXReal-v2.0.0.dmg](https://github.com/DannyDesert/XReal-Ultrawide/releases/latest/download/UltraXReal-v2.0.0.dmg)** — Open the DMG, drag to Applications, launch.
 
-> **Gatekeeper warning?** macOS will block the first launch because the app uses a private API and isn't notarized. Fix:
-> ```bash
-> xattr -cr /Applications/UltraXReal.app
-> ```
-> Or: **System Settings > Privacy & Security**, scroll down, click **"Open Anyway"**.
+> **Gatekeeper warning?** For an app you trust, use **System Settings > Privacy & Security > Open Anyway** after attempting to open it. See [Apple's instructions](https://support.apple.com/en-us/102445).
 
 ---
 
