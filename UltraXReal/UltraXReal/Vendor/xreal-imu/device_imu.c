@@ -996,7 +996,7 @@ device_imu_error_type device_imu_read(device_imu_type *device, int timeout)
 
 	if (device->offset)
 	{
-		gyroscope = FusionOffsetUpdate((FusionOffset *)device->offset, gyroscope);
+		gyroscope = FusionOffsetUpdateWithAcceleration((FusionOffset *)device->offset, gyroscope, accelerometer, deltaTime);
 	}
 
 #ifndef NDEBUG

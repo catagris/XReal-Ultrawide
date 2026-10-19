@@ -38,6 +38,14 @@ typedef struct {
     FusionVector calibrationM2;
     FusionOffsetCalibrationState calibrationState;
     bool manualBias;
+    float stationaryElapsed;
+    unsigned int stationarySamples;
+    FusionVector stationaryMean;
+    FusionVector stationaryM2;
+    FusionVector stationaryAcceleration;
+    bool motionFilterInitialised;
+    FusionVector motionGyroscope;
+    FusionVector motionAcceleration;
 } FusionOffset;
 
 //------------------------------------------------------------------------------
@@ -46,6 +54,10 @@ typedef struct {
 void FusionOffsetInitialise(FusionOffset *const offset, const unsigned int sampleRate);
 
 FusionVector FusionOffsetUpdate(FusionOffset *const offset, FusionVector gyroscope);
+
+/** Motion-gated runtime bias refinement using sensor time and acceleration in g. */
+FusionVector FusionOffsetUpdateWithAcceleration(FusionOffset *const offset, FusionVector gyroscope,
+                                               FusionVector accelerometer, float deltaTime);
 
 /** Explicit two-second stationary calibration. Motion rejects the entire window. */
 void FusionOffsetBeginCalibration(FusionOffset *const offset);
