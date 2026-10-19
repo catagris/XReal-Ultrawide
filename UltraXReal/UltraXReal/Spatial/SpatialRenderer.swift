@@ -213,6 +213,7 @@ final class SpatialRenderer: NSObject, ObservableObject {
             }
             self.outputWindow?.setFrame(screen.frame, display: true)
             self.metalView?.frame = CGRect(origin: .zero, size: screen.frame.size)
+            self.metalView?.layer?.contentsScale = max(1, screen.backingScaleFactor)
         }
     }
 
@@ -299,6 +300,7 @@ final class SpatialRenderer: NSObject, ObservableObject {
 
         metalView = MTKView(frame: CGRect(origin: .zero, size: screenFrame.size),
                             device: metalDevice)
+        metalView.wantsLayer = true
         metalView.delegate = self
         metalView.framebufferOnly = true
         metalView.preferredFramesPerSecond = xrealScreen.maximumFramesPerSecond
@@ -334,6 +336,7 @@ final class SpatialRenderer: NSObject, ObservableObject {
         // global Cocoa coords like (-408, -1080) in our setup). Without this
         // the window lands on the built-in display as a thin strip.
         window.setFrame(screenFrame, display: true)
+        metalView.layer?.contentsScale = max(1, xrealScreen.backingScaleFactor)
 
         outputWindow = window
         return true
@@ -377,6 +380,12 @@ extension SpatialRenderer: MTKViewDelegate {
                 if let view { self?.draw(in: view) }
             }
             return
+        }
+        // Display reconfiguration can leave AppKit's CAMetalLayer scale at zero.
+        // Drawables still render successfully, but the compositor shows black.
+        // Restore a valid scale before acquiring/presenting the next drawable.
+        if let layer = view.layer, layer.contentsScale <= 0 {
+            layer.contentsScale = max(1, view.window?.screen?.backingScaleFactor ?? 1)
         }
         guard isRunning, view === metalView,
               let drawable = view.currentDrawable,
